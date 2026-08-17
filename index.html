@@ -103,6 +103,21 @@
 
   /* ---------- findings ---------- */
   .find-card{border:1px solid var(--line); border-radius:10px; padding:13px; margin-bottom:12px; background:#fff;}
+
+  /* ---------- diagnostics & notes ---------- */
+  .cat-chip{display:inline-block; font-size:11px; font-weight:800; padding:3px 10px; border-radius:20px; margin-bottom:6px;}
+  .cc-fp{background:#E2ECF6; color:#164E7E;} .cc-de{background:#E2F2E8; color:#1F6B45;}
+  .cc-ce{background:#F0E9FA; color:#5B3B9E;} .cc-jp{background:#DFF0F1; color:#0E6B70;} .cc-ss{background:#FBEBDD; color:#B05C0F;}
+  .dg-checks{margin:7px 0 0; padding:0; list-style:none;}
+  .dg-checks li{padding:5px 0 5px 24px; position:relative; font-size:14px; border-bottom:1px solid #F0F3F8;}
+  .dg-checks li:last-child{border-bottom:none;}
+  .dg-checks li::before{content:'→'; position:absolute; left:2px; color:var(--accent); font-weight:700;}
+  .dg-tip{font-size:12.5px; color:var(--mut); font-style:italic; margin-top:6px;}
+  .filter-chips{display:flex; gap:6px; overflow-x:auto; padding:2px 2px 10px; scrollbar-width:none;}
+  .filter-chips::-webkit-scrollbar{display:none;}
+  .fchip{flex:none; border:1px solid var(--line); background:#fff; border-radius:18px; padding:6px 13px; font-size:12.5px; font-weight:700; color:var(--mut); white-space:nowrap;}
+  .fchip.on{background:var(--accent); border-color:var(--accent); color:#fff;}
+  .hint{font-size:12.5px; color:var(--mut); margin:2px 2px 10px;}
   .sev-chips{display:flex; gap:7px; flex-wrap:wrap; margin-bottom:10px;}
   .sev{border:1.5px solid var(--line); background:#fff; border-radius:18px; padding:6px 13px; font-size:12.5px; font-weight:700; color:var(--mut);}
   .sev.on-Critical{background:var(--fault); border-color:var(--fault); color:#fff;}
@@ -230,6 +245,10 @@ try{ jobs = JSON.parse(localStorage.getItem(LS_KEY) || '[]'); }catch(e){ jobs = 
 let cur = null;          // current job being edited
 let curTab = 'job';
 let listFilter = {q:'', type:''};
+let homeTab = 'jobs';
+let diagFilter = {q:'', cat:''};
+let notesQ = '';
+let diagEdit = null, diagNew = null;
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -373,6 +392,13 @@ const buildChecklist = tpl => tpl.map(([g,l]) => ({id:uid(), group:g, label:l, r
 function getPath(o,p){ return p.split('.').reduce((t,k)=>t==null?t:t[k], o); }
 function setPath(o,p,v){ const a=p.split('.'); let t=o; for(let i=0;i<a.length-1;i++) t=t[a[i]]; t[a[a.length-1]]=v; }
 document.addEventListener('input', e => {
+  const nt = e.target.dataset.nt;
+  if(nt){
+    const i = nt.indexOf(':');
+    const n = notes.find(x=>x.id===nt.slice(0,i));
+    if(n){ n[nt.slice(i+1)] = e.target.value; n.updated = Date.now(); saveNotes(); }
+    return;
+  }
   const p = e.target.dataset.p;
   if(!p || !cur) return;
   setPath(cur, p, e.target.value);
@@ -391,7 +417,7 @@ function render(){
   document.getElementById('reportBtn').style.display = cur ? '' : 'none';
   document.getElementById('headTitle').textContent = cur ? (cur.reportNo||'Job') : 'Zaid Pumps Diary';
   document.getElementById('headSub').textContent = cur ? (cur.siteName||typeShort(cur.jobType)) : 'Fire Pump Maintenance & Commissioning';
-  document.getElementById('main').innerHTML = cur ? viewJob() : viewList();
+  document.getElementById('main').innerHTML = cur ? viewJob() : viewHome();
   if(cur){
     document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on', p.id==='panel-'+curTab));
     if(curTab==='summary') setTimeout(initSigs, 30);
@@ -399,19 +425,29 @@ function render(){
   }
 }
 
-/* ---------- jobs list ---------- */
-function viewList(){
-  let list = jobs.slice().sort((a,b)=> (b.date||'').localeCompare(a.date||''));
-  if(listFilter.q){ const q=listFilter.q.toLowerCase(); list=list.filter(j=>(j.siteName+' '+j.client+' '+j.reportNo).toLowerCase().includes(q)); }
-  if(listFilter.type) list=list.filter(j=>j.jobType===listFilter.type);
-  let h = `<div class="toolbar">
+/* ---------- home: jobs / diagnostics / notes ---------- */
+function viewHome(){
+  const nav = `<div class="tabs" style="padding-top:2px">${[['jobs','📋 Jobs'],['diag','🔧 Diagnostics'],['notes','📝 My Notes']].map(([k,l])=>`<button class="tab ${homeTab===k?'on':''}" onclick="homeTab='${k}';render()">${l}</button>`).join('')}</div>`;
+  const body = homeTab==='diag' ? viewDiag() : homeTab==='notes' ? viewNotes() : viewJobs();
+  return nav + body + `<footer>Created by Zaid Obaid</footer>`;
+}
+
+function viewJobs(){
+  return `<div class="toolbar">
     <input type="search" placeholder="Search site, client, report no…" value="${esc(listFilter.q)}" oninput="listFilter.q=this.value; refreshList()">
     <select onchange="listFilter.type=this.value; refreshList()">
       <option value="">All types</option>${JOB_TYPES.map(t=>`<option ${listFilter.type===t?'selected':''}>${t}</option>`).join('')}
     </select>
   </div>
   <button class="bigbtn" onclick="createJob()">＋ New Job</button><div style="height:14px"></div>
-  <div id="jobList">`;
+  <div id="jobList">${jobsListHtml()}</div>`;
+}
+
+function jobsListHtml(){
+  let list = jobs.slice().sort((a,b)=> (b.date||'').localeCompare(a.date||''));
+  if(listFilter.q){ const q=listFilter.q.toLowerCase(); list=list.filter(j=>(j.siteName+' '+j.client+' '+j.reportNo).toLowerCase().includes(q)); }
+  if(listFilter.type) list=list.filter(j=>j.jobType===listFilter.type);
+  let h = '';
   if(!list.length){
     h += `<div class="empty"><b>No jobs yet</b>Tap <b style="display:inline">＋ New Job</b> to record your first site visit — commissioning, maintenance or call-out.</div>`;
   } else {
@@ -436,10 +472,9 @@ function viewList(){
       </div>`;
     }).join('');
   }
-  h += `</div><footer>Created by Zaid Obaid</footer>`;
   return h;
 }
-function refreshList(){ if(!cur) document.getElementById('main').innerHTML = viewList(); }
+function refreshList(){ const el=document.getElementById('jobList'); if(el) el.innerHTML = jobsListHtml(); }
 function fmtDate(d){ if(!d) return ''; const [y,m,dd]=d.split('-'); return dd&&m&&y ? `${dd}/${m}/${y}` : d; }
 
 function createJob(){
@@ -959,12 +994,191 @@ function pumpCurveSVG(j,p){
   </svg><div style="font-size:10.5px; color:#6B7A8C">Measured performance curve — ◇ marks the rated duty point (${rF} ${j.flowU} @ ${rP} ${j.presU})</div></div>`;
 }
 
+/* ============================================================
+   Diagnostics — fault-finding library (editable, seeded)
+   ============================================================ */
+const LS_DIAG = 'fps_diag_v1', LS_NOTES = 'fps_notes_v1';
+const DIAG_CATS = ['Fire Pump','Diesel Engine','Controller & Electrical','Jockey Pump','Sprinkler System'];
+const catClass = c => ({'Fire Pump':'cc-fp','Diesel Engine':'cc-de','Controller & Electrical':'cc-ce','Jockey Pump':'cc-jp','Sprinkler System':'cc-ss'})[c] || 'cc-fp';
+
+const SEED_DIAG = [
+ ['Fire Pump','Pump fails to start automatically on pressure drop',
+  ['Controller is in AUTO mode','Pressure switch cut-in setting vs actual system pressure','Sensing line isolation valves open and line not blocked','Power available / breaker closed (electric) or batteries charged (diesel)','Start pressure actually reached during the drop test'],
+  'Start sequence should be: jockey first, then electric, then diesel. Starts out of order = overlapping pressure settings.'],
+ ['Fire Pump','Pump runs but delivers no water',
+  ['Suction valve fully open','Tank water level and float valve','Pump casing primed — vent air from casing','Suction strainer / foot valve blockage','Correct direction of rotation','Air lock in suction pipe — check gradient and eccentric reducer orientation']],
+ ['Fire Pump','Discharge pressure lower than rated duty',
+  ['Pump speed (RPM) vs nameplate','Direction of rotation','Impeller wear or blockage','Air entering suction — gland, fittings','Suction level low / lift too high','Gauges reading correctly']],
+ ['Fire Pump','Pump overheats when running at churn',
+  ['Circulation relief valve fitted, set correctly, not blocked','Relief line visibly discharging','Do not run at zero flow longer than necessary'],
+  'Never leave a fire pump running at churn unattended for long periods.'],
+ ['Fire Pump','Excessive vibration or noise',
+  ['Coupling alignment','Holding-down bolts tight','Bearing condition','Cavitation — check for suction restriction','Debris in impeller','Pipework supported independently of pump']],
+ ['Fire Pump','Packing gland leaking too much',
+  ['Adjust gland nuts evenly to about 1 drip per second','Packing rings worn — repack','Shaft sleeve scored'],
+  'A packing gland MUST drip — never tighten it fully, the packing needs water for cooling.'],
+ ['Fire Pump','Gland running hot / no drip',
+  ['Slacken gland nuts','Lantern ring aligned with flush port','Flush line clear']],
+ ['Fire Pump','Bearings running hot',
+  ['Correct grease amount — over-greasing also overheats','Alignment','Excessive axial thrust / impeller balance']],
+ ['Fire Pump','Relief valve discharging continuously',
+  ['System pressure vs relief set point','Churn pressure too high — check pump speed','Relief valve setting drifted or seat fouled']],
+ ['Fire Pump','Pressure gauges flickering / unsteady',
+  ['Air in system','Cavitation at suction','Sensing line partly blocked','Gauge snubber missing or blocked']],
+
+ ['Diesel Engine','Engine will not crank',
+  ['Battery voltage on both sets (healthy is above 12.4V rested)','Terminals clean and tight','Battery isolators / selector switch','Starter solenoid clicking? If yes suspect starter motor','Controller finished its 6-attempt crank cycle — needs reset','Main engine fuses'],
+  'Weak batteries are the number one cause of failed diesel starts — check them every single visit.'],
+ ['Diesel Engine','Cranks but will not fire',
+  ['Fuel tank level and outlet valve open','Air in fuel — bleed lines through to injectors','Fuel filters blocked (change if dark or waxy)','Fuel stop solenoid energising — listen for the click','Air filter blocked','Cold engine — is the jacket water heater working?']],
+ ['Diesel Engine','Starts then shuts down',
+  ['Fuel restriction or air leak into fuel lines','Overspeed trip operated — verify and reset','Check what the controller shows as the cause'],
+  'In AUTO a fire pump engine should NOT shut down on low oil pressure or high temperature — those are alarm-only. Shutdowns apply in TEST mode.'],
+ ['Diesel Engine','Low oil pressure alarm',
+  ['Dipstick level and oil condition','Oil diluted with fuel — smell it','Correct oil grade / filter recently changed','Cross-check sender against a mechanical gauge','If genuinely low — bearing wear, do not run']],
+ ['Diesel Engine','Engine overheating',
+  ['Coolant level in expansion tank','Cooling loop valves open (heat-exchanger sets)','Cooling loop strainer and pressure reducing valve','Heat exchanger tubes scaled','Thermostat','Radiator sets — belt tension and airflow']],
+ ['Diesel Engine','Battery or charger alarm on controller',
+  ['Charger DC output (float around 13.2–13.8V per 12V battery)','AC supply to the charger','Electrolyte levels','Terminal corrosion','Battery age — replace around every 2–3 years','Engine alternator belt if engine-charged']],
+ ['Diesel Engine','Black smoke under load',
+  ['Air filter blocked','Engine overloaded — pump end binding?','Injector fault']],
+ ['Diesel Engine','White or blue smoke',
+  ['Cold start — normal briefly','Low compression','Oil passing valve seals or rings','Injection timing']],
+ ['Diesel Engine','Hunting / uneven running',
+  ['Air in fuel','Fuel filters','Governor linkage','Injector fault']],
+ ['Diesel Engine','Jacket water heater cold',
+  ['Heater supply breaker','Element continuity','Heater thermostat'],
+  'The heater should keep the engine at roughly 49°C minimum so it can start and take load immediately.'],
+
+ ['Controller & Electrical','Electric pump will not start (auto or manual)',
+  ['Supply present — phase lamps / voltmeter','Isolator and breaker closed','Control circuit fuses','Contactor pulling in?','Pressure switch contacts','Emergency start handle mechanism']],
+ ['Controller & Electrical','Phase failure or phase reversal alarm',
+  ['All three phases present at incoming terminals','Building supply / generator changeover','Phase monitor relay itself faulty']],
+ ['Controller & Electrical','Pump does not stop after pressure restored',
+  ['Minimum run timer still counting (often 10 minutes)','System pressure actually above cut-out?','Controller set for manual stop only — common and acceptable']],
+ ['Controller & Electrical','No remote alarms at BMS / fire panel',
+  ['Volt-free contacts operating — meter across them during lamp test','Interface wiring and terminations','Panel side zone mapping']],
+
+ ['Jockey Pump','Jockey pump runs continuously',
+  ['System leak downstream','Main pump check valve passing back','Jockey non-return valve passing','Cut-out pressure actually reachable — worn jockey may never get there']],
+ ['Jockey Pump','Jockey short-cycling (starts every few minutes)',
+  ['Small leak — walk the system and look','Cut-in/cut-out differential too narrow — widen to roughly 0.7–1.0 bar','Check valve slamming / passing','No air cushion in system']],
+ ['Jockey Pump','Jockey tripping on overload',
+  ['Running current vs nameplate','Pump seized or damaged from dry running','Supply voltage','Overload set correctly']],
+
+ ['Sprinkler System','System pressure drops overnight (pumps off)',
+  ['Small leaks at heads and joints','Drain and test valves fully shut','Alarm/check valve seat passing','Temperature drop causes a small dip — normal','Watch the gauge with the jockey isolated to measure the real leak rate — reinstate after!']],
+ ['Sprinkler System','Water motor gong / flow alarm with no fire',
+  ['Alarm valve passing on pressure surges','Retard chamber drain blocked','Jockey cycling causing surges','Flow switch delay setting']],
+ ['Sprinkler System','False main pump starts with no flow',
+  ['Sensing line leaks','Jockey failed — fix the jockey first','Cut-in pressures too close together — check the sequence spacing','Pressure surges from other connected systems']],
+ ['Sprinkler System','Zone flow/pressure switch faults',
+  ['Zone isolation valve position','Switch calibration','Wiring and panel zone mapping']],
+ ['Sprinkler System','Alarm valve will not reinstate (keeps tripping)',
+  ['Re-pressurise downstream slowly before opening the main valve','Retard chamber operation','Debris on the valve seat — flush it','Gauges equal above and below before opening']],
+];
+
+let diag, notes;
+try{ diag = JSON.parse(localStorage.getItem(LS_DIAG)); }catch(e){ diag = null; }
+try{ notes = JSON.parse(localStorage.getItem(LS_NOTES)) || []; }catch(e){ notes = []; }
+if(!Array.isArray(diag)){
+  diag = SEED_DIAG.map(([cat,symptom,checks,tip]) => ({id:uid(), cat, symptom, checks, tip:tip||''}));
+  saveDiag();
+}
+if(!Array.isArray(notes)) notes = [];
+function saveDiag(){ try{ localStorage.setItem(LS_DIAG, JSON.stringify(diag)); }catch(e){ showToast('Storage full — could not save.', 'err'); } }
+function saveNotes(){ try{ localStorage.setItem(LS_NOTES, JSON.stringify(notes)); }catch(e){ showToast('Storage full — could not save.', 'err'); } }
+
+function viewDiag(){
+  return `<div class="hint">Your fault-finding library — search a symptom to see what to check. Edit any entry or add your own. Never shown in client reports.</div>
+  <div class="toolbar">
+    <input type="search" placeholder="Search a fault… e.g. engine will not start" value="${esc(diagFilter.q)}" oninput="diagFilter.q=this.value; refreshDiag()">
+  </div>
+  <div class="filter-chips">${['',...DIAG_CATS].map(c=>`<button class="fchip ${diagFilter.cat===c?'on':''}" onclick="diagFilter.cat='${c}';render()">${c||'All'}</button>`).join('')}</div>
+  <button class="bigbtn" onclick="addDiag()">＋ Add Fault Entry</button><div style="height:12px"></div>
+  <div id="diagList">${diagListHtml()}</div>`;
+}
+
+function diagListHtml(){
+  let list = diag;
+  if(diagFilter.cat) list = list.filter(d=>d.cat===diagFilter.cat);
+  if(diagFilter.q){ const q=diagFilter.q.toLowerCase(); list = list.filter(d=>(d.symptom+' '+d.checks.join(' ')+' '+(d.tip||'')).toLowerCase().includes(q)); }
+  if(!list.length) return `<div class="empty"><b>No matches</b>Try different words — or add this fault as a new entry so it's there next time.</div>`;
+  return list.map(d => d.id===diagEdit ? diagEditCard(d) : diagReadCard(d)).join('');
+}
+
+function diagReadCard(d){
+  return `<div class="find-card">
+    <span class="cat-chip ${catClass(d.cat)}">${esc(d.cat)}</span>
+    <div style="font-weight:700; font-size:15px">${esc(d.symptom)}</div>
+    <ul class="dg-checks">${d.checks.map(c=>`<li>${esc(c)}</li>`).join('')}</ul>
+    ${d.tip?`<div class="dg-tip">💡 ${esc(d.tip)}</div>`:''}
+    <div style="margin-top:9px"><button class="sbtn" onclick="editDiag('${d.id}')">Edit</button></div>
+  </div>`;
+}
+
+function diagEditCard(d){
+  return `<div class="find-card" style="border-left:4px solid var(--accent)">
+    <div class="field"><label>Category</label><select id="dg-cat">${DIAG_CATS.map(c=>`<option ${d.cat===c?'selected':''}>${c}</option>`).join('')}</select></div>
+    <div class="field"><label>Fault / symptom</label><textarea id="dg-sym" style="min-height:48px" placeholder="e.g. Diesel engine cranks but will not start">${esc(d.symptom)}</textarea></div>
+    <div class="field"><label>What to check — one item per line</label><textarea id="dg-checks" style="min-height:120px" placeholder="Fuel level and valve open&#10;Bleed air from fuel lines&#10;Fuel filters">${esc(d.checks.join('\n'))}</textarea></div>
+    <div class="field"><label>Extra tip (optional)</label><input id="dg-tip" value="${esc(d.tip||'')}"></div>
+    <div class="addrow">
+      <button class="sbtn primary" onclick="saveDiagEntry()">Save</button>
+      <button class="sbtn" onclick="cancelDiag()">Cancel</button>
+      <button class="sbtn danger" onclick="if(armed(this))delDiag('${d.id}')">Delete</button>
+    </div>
+  </div>`;
+}
+
+function refreshDiag(){ const el=document.getElementById('diagList'); if(el) el.innerHTML = diagListHtml(); }
+function addDiag(){
+  const e = {id:uid(), cat:diagFilter.cat||'Fire Pump', symptom:'', checks:[], tip:''};
+  diag.unshift(e); diagEdit = e.id; diagNew = e.id; render();
+}
+function editDiag(id){ diagEdit = id; diagNew = null; render(); }
+function cancelDiag(){ if(diagNew) diag = diag.filter(d=>d.id!==diagNew); diagEdit = diagNew = null; render(); }
+function saveDiagEntry(){
+  const d = diag.find(x=>x.id===diagEdit); if(!d) return;
+  d.cat = document.getElementById('dg-cat').value;
+  d.symptom = document.getElementById('dg-sym').value.trim();
+  d.checks = document.getElementById('dg-checks').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  d.tip = document.getElementById('dg-tip').value.trim();
+  if(!d.symptom){ showToast('Describe the fault first.', 'err'); return; }
+  diagEdit = diagNew = null; saveDiag(); render(); showToast('Saved to your library.');
+}
+function delDiag(id){ diag = diag.filter(d=>d.id!==id); diagEdit = diagNew = null; saveDiag(); render(); showToast('Entry deleted.'); }
+
+/* ---------- private notes ---------- */
+function viewNotes(){
+  return `<div class="hint">Private reference notes — for you only, never printed in reports. Everything saves as you type.</div>
+  <div class="toolbar"><input type="search" placeholder="Search notes…" value="${esc(notesQ)}" oninput="notesQ=this.value; refreshNotes()"></div>
+  <button class="bigbtn" onclick="addNote()">＋ New Note</button><div style="height:12px"></div>
+  <div id="notesList">${notesListHtml()}</div>`;
+}
+function notesListHtml(){
+  let list = notes;
+  if(notesQ){ const q=notesQ.toLowerCase(); list = list.filter(n=>(n.title+' '+n.body).toLowerCase().includes(q)); }
+  if(!list.length) return `<div class="empty"><b>No notes yet</b>Keep pressure settings, part numbers, supplier contacts, site quirks — anything useful for next time.</div>`;
+  return list.map(n=>`<div class="find-card">
+    <div class="field" style="margin-bottom:8px"><input data-nt="${n.id}:title" placeholder="Title…" value="${esc(n.title)}" style="font-weight:700"></div>
+    <textarea data-nt="${n.id}:body" style="min-height:90px" placeholder="Write your note…">${esc(n.body)}</textarea>
+    <div style="display:flex; align-items:center; margin-top:8px">
+      <span style="flex:1; font-size:11.5px; color:var(--mut)">${n.updated?new Date(n.updated).toLocaleDateString('en-GB'):''}</span>
+      <button class="sbtn danger" onclick="if(armed(this))delNote('${n.id}')">Delete</button>
+    </div>
+  </div>`).join('');
+}
+function refreshNotes(){ const el=document.getElementById('notesList'); if(el) el.innerHTML = notesListHtml(); }
+function addNote(){ notes.unshift({id:uid(), title:'', body:'', updated:Date.now()}); saveNotes(); render(); }
+function delNote(id){ notes = notes.filter(n=>n.id!==id); saveNotes(); render(); showToast('Note deleted.'); }
+
 /* ---------------- backup ---------------- */
 function toggleMenu(){ const m=document.getElementById('menu'); m.style.display = m.style.display==='none'?'block':'none'; }
 document.addEventListener('click', e=>{ if(!e.target.closest('#menu') && !e.target.closest('#menuBtn')) document.getElementById('menu').style.display='none'; });
 async function exportBackup(){
   toggleMenu();
-  const json = JSON.stringify(jobs, null, 1);
+  const json = JSON.stringify({app:'zaid-pumps-diary', version:2, jobs, diag, notes}, null, 1);
   const fname = `pumps-diary-backup-${new Date().toISOString().slice(0,10)}.json`;
   // On the claude.ai phone app the viewer mediates saves; locally use a normal download
   const dl = (typeof claude !== 'undefined' && typeof claude.use === 'function') ? await claude.use('downloads') : null;
@@ -984,11 +1198,18 @@ function importBackup(input){
   const rd = new FileReader();
   rd.onload = () => {
     try{
-      const arr = JSON.parse(rd.result);
-      if(!Array.isArray(arr)) throw 0;
+      const data = JSON.parse(rd.result);
+      const jobsArr = Array.isArray(data) ? data : (data.jobs || []);
+      if(!Array.isArray(jobsArr)) throw 0;
       let added=0, updated=0;
-      arr.forEach(nj=>{ const i=jobs.findIndex(x=>x.id===nj.id); if(i>=0){jobs[i]=nj; updated++;} else {jobs.push(nj); added++;} });
-      save(); render();
+      jobsArr.forEach(nj=>{ const i=jobs.findIndex(x=>x.id===nj.id); if(i>=0){jobs[i]=nj; updated++;} else {jobs.push(nj); added++;} });
+      save();
+      if(!Array.isArray(data)){
+        (data.diag  || []).forEach(d=>{ const i=diag.findIndex(x=>x.id===d.id);  if(i>=0) diag[i]=d;  else diag.push(d); });
+        (data.notes || []).forEach(n=>{ const i=notes.findIndex(x=>x.id===n.id); if(i>=0) notes[i]=n; else notes.push(n); });
+        saveDiag(); saveNotes();
+      }
+      render();
       showToast(`Backup imported — ${added} job(s) added, ${updated} updated.`);
     }catch(e){ showToast('That file is not a valid backup.', 'err'); }
   };
