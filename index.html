@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="color-scheme" content="only light">
 <meta name="theme-color" content="#164E7E">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Pumps Diary">
@@ -12,6 +13,7 @@
 <title>Zaid Pumps Diary</title>
 <style>
   :root{
+    color-scheme: only light;   /* block Android Chrome force-dark — it makes printed PDFs unreadable */
     --accent:#164E7E; --accent-deep:#0E3B61; --navy:#12263A; --navy-2:#1D3A57;
     --bg:#F2F4F8; --card:#FFFFFF; --line:#E1E6EE; --txt:#1B2733; --mut:#6B7A8C;
     --ok:#1E8E4E; --ok-bg:#E4F5EB; --fault:#C8102E; --fault-bg:#FBE7EA;
@@ -190,7 +192,9 @@
   .chip.OK{background:var(--ok-bg); color:var(--ok);} .chip.FAULT{background:var(--fault-bg); color:var(--fault);} .chip.NA{background:var(--na-bg); color:var(--na);}
 
   @media print{
-    body{background:#fff;}
+    html, body{background:#fff !important; color:#1B2733 !important;}
+    .rep-page{background:#fff !important; color:#1B2733 !important;}
+    table.rp td{background:#fff;}
     header, main, .rep-bar, .rep-hint, #toast, #bg3d{display:none !important;}
     #reportOverlay{display:block !important; position:static; background:#fff; overflow:visible;}
     .rep-page{box-shadow:none; margin:0; max-width:none; padding:0;}
