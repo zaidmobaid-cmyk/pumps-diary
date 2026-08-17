@@ -288,6 +288,7 @@ function armed(btn, label){
 const JOB_TYPES = ['Commissioning','Preventive Maintenance','Corrective Maintenance / Call-out','Inspection & Testing'];
 const typeBadge = t => t==='Commissioning' ? 'b-comm' : t==='Preventive Maintenance' ? 'b-pm' : t==='Inspection & Testing' ? 'b-insp' : 'b-call';
 const typeShort = t => t==='Corrective Maintenance / Call-out' ? 'Call-out' : t==='Preventive Maintenance' ? 'Maintenance' : t==='Inspection & Testing' ? 'Inspection' : t;
+const isDieselRole = r => (r||'').includes('Diesel');
 
 function nextReportNo(){
   const y = new Date().getFullYear();
@@ -574,8 +575,9 @@ function tabPumps(){
     <div class="addrow">
       <button class="sbtn primary" onclick="addPump('Electric Main')">＋ Electric</button>
       <button class="sbtn primary" onclick="addPump('Diesel Main')">＋ Diesel</button>
+      <button class="sbtn" onclick="addPump('Standby Diesel')">＋ Standby Diesel</button>
       <button class="sbtn primary" onclick="addPump('Jockey')">＋ Jockey</button>
-      <button class="sbtn" onclick="addPump('Standby Electric')">＋ Standby</button>
+      <button class="sbtn" onclick="addPump('Standby Electric')">＋ Standby Electric</button>
     </div></div>`;
   if(!cur.pumps.length) h += `<div class="empty"><b>No pumps added</b>Add each pump in the set — readings and tests are recorded per pump.</div>`;
   h += cur.pumps.map((p,i)=>pumpCard(p,i)).join('');
@@ -588,14 +590,14 @@ function removePump(i){ cur.pumps.splice(i,1); save(); render(); showToast('Pump
 function pumpCard(p,i){
   const P = `pumps.${i}.`, T = `pumps.${i}.t.`;
   const isJockey = p.role==='Jockey';
-  const isDiesel = p.role==='Diesel Main';
+  const isDiesel = isDieselRole(p.role);
   const fu = cur.flowU, pu = cur.presU;
   let h = `<div class="pump-card">
     <div class="pump-head">
       <div class="pump-title">${esc(p.role)} Pump</div>
       <button class="sbtn danger" onclick="if(armed(this))removePump(${i})">Remove</button>
     </div>
-    <div class="field"><label>Pump Role</label><select data-p="${P}role" onchange="save();render()">${['Electric Main','Diesel Main','Jockey','Standby Electric'].map(r=>`<option ${p.role===r?'selected':''}>${r}</option>`).join('')}</select></div>
+    <div class="field"><label>Pump Role</label><select data-p="${P}role" onchange="save();render()">${['Electric Main','Diesel Main','Standby Electric','Standby Diesel','Jockey'].map(r=>`<option ${p.role===r?'selected':''}>${r}</option>`).join('')}</select></div>
     <div class="grid3">
       ${F('Make', P+'make')}
       ${F('Model', P+'model')}
@@ -869,7 +871,7 @@ function buildReport(j){
       <tr><th>Pump</th><th>Make / Model</th><th>Serial</th><th>Rated Duty</th><th>Driver</th><th>Controller</th></tr>`;
     j.pumps.forEach(p=>{
       const duty = (p.ratedFlow||p.ratedPressure) ? `${esc(p.ratedFlow||'?')} ${fu} @ ${esc(p.ratedPressure||'?')} ${pu}${p.ratedRpm?` · ${esc(p.ratedRpm)} rpm`:''}` : '—';
-      const driver = p.role==='Diesel Main'
+      const driver = isDieselRole(p.role)
         ? [p.engineMake,p.engineModel].filter(Boolean).join(' ') + (p.engineSerial?` (S/N ${p.engineSerial})`:'') + (p.batteries?` · ${p.batteries}`:'')
         : [p.motorKw?`${p.motorKw} kW`:'', p.voltage?`${p.voltage} V`:'', p.fla?`FLA ${p.fla} A`:''].filter(Boolean).join(' · ');
       h += `<tr><td><b>${esc(p.role)}</b></td><td>${val([p.make,p.model].filter(Boolean).join(' '))}</td><td>${val(p.serial)}</td><td>${duty}</td><td>${esc(driver)||'—'}</td><td>${val([p.ctrlMake,p.ctrlModel].filter(Boolean).join(' '))}${p.ctrlSerial?`<br><span style="color:var(--mut)">S/N ${esc(p.ctrlSerial)}</span>`:''}</td></tr>`;
@@ -883,14 +885,14 @@ function buildReport(j){
     const hasFlowTest = [t.chDis,t.rDis,t.pDis,t.rFlow,t.pFlow].some(v=>v!=='');
     const hasJockey = p.role==='Jockey' && [t.jCutIn,t.jCutOut,t.jDis,t.jOk].some(v=>v!=='');
     const hasStart = [t.cutInObs,t.autoStart,t.startTime,t.runMin].some(v=>v!=='');
-    const hasDiesel = p.role==='Diesel Main' && [t.oilP,t.engTemp,t.batt1,t.batt2,t.crankA,t.crankB].some(v=>v!=='');
+    const hasDiesel = isDieselRole(p.role) && [t.oilP,t.engTemp,t.batt1,t.batt2,t.crankA,t.crankB].some(v=>v!=='');
     if(!hasFlowTest && !hasJockey && !hasStart && !hasDiesel) return;
     h += `<div class="rp-sec">Test Results — ${esc(p.role)} Pump</div>`;
     if(p.role==='Jockey'){
       if(hasJockey) h += `<table class="rp"><tr><th>Cut-in (${pu})</th><th>Cut-out (${pu})</th><th>Discharge (${pu})</th><th>Operates Correctly</th></tr>
         <tr><td>${val(t.jCutIn)}</td><td>${val(t.jCutOut)}</td><td>${val(t.jDis)}</td><td>${val(t.jOk)}</td></tr></table>`;
     } else if(hasFlowTest){
-      const isD = p.role==='Diesel Main';
+      const isD = isDieselRole(p.role);
       const net = (d,s)=>{ const dd=num(d); if(dd==null) return '—'; return (dd-(num(s)||0)).toFixed(1); };
       h += `<table class="rp"><tr><th>Test Point</th><th>Flow (${fu})</th><th>Suction (${pu})</th><th>Discharge (${pu})</th><th>Net (${pu})</th><th>RPM</th>${isD?'':`<th>Volts</th><th>Amps</th>`}</tr>
       <tr><td><b>Churn (0%)</b></td><td>0</td><td>${val(t.chSuc)}</td><td>${val(t.chDis)}</td><td>${net(t.chDis,t.chSuc)}</td><td>${val(t.chRpm)}</td>${isD?'':`<td>${val(t.chV)}</td><td>${val(t.chA)}</td>`}</tr>
