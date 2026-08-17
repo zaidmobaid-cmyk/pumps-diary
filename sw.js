@@ -1,5 +1,5 @@
 /* Zaid Pumps Diary — offline cache. Bump CACHE version when the app is updated. */
-const CACHE = 'pumps-diary-v2';
+const CACHE = 'pumps-diary-v3';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
