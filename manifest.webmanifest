@@ -1,0 +1,15 @@
+{
+  "name": "Zaid Pumps Diary",
+  "short_name": "Pumps Diary",
+  "description": "Fire pump maintenance & commissioning field reports",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EDF2F7",
+  "theme_color": "#164E7E",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
