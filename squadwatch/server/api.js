@@ -1,0 +1,1429 @@
+'use strict';
+// HTTP server: REST + SSE + static file serving.
+// SPEC §13 with binding amendments: §19.1.4 (parserHealth dep), §19.1.6
+// (revive SSE event), §19.1.7 (overview tksToday), §19.1.8 (trolls all/week),
+// §19.1.10 (settings gameVersion), §19.2.13/14 (bans.steam_id + stub players,
+// flags.review_note), §19.3.15 (setup token), §19.3.16 (SQL whitelist maps),
+// §19.3.18 (session JOIN + destroyUserSessions on user mutation), §19.3.19
+// (trustProxy/clientIp), §19.3.20 (exact CSRF algorithm + Content-Type),
+// §19.3.21 (pagination clamps + LIMIT 2000 truncation), §19.3.22 (SSE
+// single-listener fanout, per-user/global caps, ping, viewer filtering),
+// §19.3.23 (viewer intel exclusions; audit admin+), §19.3.25 (security
+// headers + exact CSP), §19.3.26 (static serving rules), §19.3.27 (secret
+// redaction).
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const { log, sanitizeRconArg, parseInterval, clampInt } = require('./util');
+const { ACTION_NAMES, STEAM_ID_RE, INTERVAL_RE } = require('./admin');
+
+const BODY_LIMIT = 64 * 1024; // §13: JSON only, 64KB cap
+const COOKIE_NAME = 'sw_session';
+const COOKIE_MAX_AGE = 2592000; // 30 days, matches session TTL
+const CAP = 2000; // §19.3.21 "[all]" list cap
+
+// §19.3.25 — exact CSP, applied to HTML responses.
+const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' " +
+  'https://fonts.googleapis.com; font-src https://fonts.gstatic.com; ' +
+  "img-src 'self' https: data:; connect-src 'self'; frame-ancestors 'none'";
+
+// §19.3.26 — whitelisted extensions with an explicit MIME table.
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json',
+  '.map': 'application/json',
+  '.woff2': 'font/woff2',
+};
+
+// §19.3.27 — config paths whose values are redacted/scrubbed.
+const REDACT_PATHS = [
+  'squad.rconPassword', 'log.ftp.password', 'log.sftp.password', 'steamApiKey', 'discordWebhook',
+];
+const REDACTED = '•••'; // •••
+
+// §19.3.16 — whitelist lookup maps; unknown key -> 400.
+const PLAYER_SORT = {
+  last_seen: 'last_seen', kills: 'kills', teamkills: 'teamkills',
+  radio: 'radio_damage_friendly', playtime: 'play_seconds',
+};
+const SORT_DIR = { asc: 'ASC', desc: 'DESC' };
+const PLAYER_FILTERS = new Set(['online', 'flagged', 'watchlisted', 'banned']);
+const CHAT_CHANNELS = new Set(['all', 'team', 'squad', 'admin']);
+const FLAGS_REVIEWED = { 0: 'f.reviewed = 0', 1: 'f.reviewed = 1', all: null };
+const BANS_ACTIVE = new Set(['1', '0', 'all']);
+const MATCH_OPS = { restart: 'restartMatch', end: 'endMatch' };
+
+const UNBAN_NOTE = 'Ban deactivated in SquadWatch (join enforcement stops immediately). ' +
+  'Squad has no RCON unban command — if this ban was exported, remove the SteamID line from ' +
+  'Bans.cfg on the game server (then AdminReloadServerConfig or wait for map change). ' +
+  'If the player is currently online, nothing more to do.';
+
+class ApiErr extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+function parseDetails(s) {
+  if (s == null) return null;
+  try { return JSON.parse(s); } catch (_e) { return s; }
+}
+function likeEscape(s) { return String(s).replace(/[\\%_]/g, (c) => '\\' + c); }
+function getPath(obj, dotted) {
+  let cur = obj;
+  for (const k of dotted.split('.')) {
+    if (cur == null || typeof cur !== 'object') return undefined;
+    cur = cur[k];
+  }
+  return cur;
+}
+function setPath(obj, dotted, val) {
+  const ks = dotted.split('.');
+  let cur = obj;
+  for (let i = 0; i < ks.length - 1; i++) {
+    if (cur == null || typeof cur !== 'object') return;
+    cur = cur[ks[i]];
+  }
+  if (cur && typeof cur === 'object') cur[ks[ks.length - 1]] = val;
+}
+function utcDayStart(t) {
+  const d = new Date(t);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/**
+ * createApi({db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version})
+ *   -> http.Server (caller listens; server.close() tears down SSE + bus wiring).
+ */
+function createApi(deps) {
+  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version } = deps || {};
+  const cfg = config || {};
+  const web = cfg.web || {};
+  const trustProxy = web.trustProxy === true; // §19.3.19, default false
+  const pubDir = path.resolve(__dirname, '..', 'public');
+  const ph = parserHealth && typeof parserHealth.count24h === 'function'
+    ? parserHealth : { count24h: () => 0, samples: () => [] };
+  const AUDIT_ACTIONS = new Set([
+    ...((admin && Array.isArray(admin.actions)) ? admin.actions : ACTION_NAMES),
+    'setNextLayer', 'unban', 'note', 'watch', 'manual-flag', 'flag-review',
+    'user-create', 'user-update', 'setup',
+  ]);
+
+  // ------------------------------------------------------- secret redaction
+  const secretVals = REDACT_PATHS
+    .map((p) => getPath(cfg, p))
+    .filter((v) => typeof v === 'string' && v.length >= 3);
+
+  function scrubText(s) {
+    let out = String(s == null ? '' : s);
+    for (const v of secretVals) if (out.includes(v)) out = out.split(v).join(REDACTED);
+    return out;
+  }
+  function scrubDeep(x) {
+    if (x == null) return x;
+    if (typeof x === 'string') return scrubText(x);
+    if (Array.isArray(x)) return x.map(scrubDeep);
+    if (typeof x === 'object') {
+      const o = {};
+      for (const k of Object.keys(x)) o[k] = scrubDeep(x[k]);
+      return o;
+    }
+    return x;
+  }
+  function redactedConfig() {
+    let clone;
+    try { clone = JSON.parse(JSON.stringify(cfg)); } catch (_e) { clone = {}; }
+    for (const p of REDACT_PATHS) {
+      const v = getPath(clone, p);
+      if (typeof v === 'string' && v.length > 0) setPath(clone, p, REDACTED);
+    }
+    return clone;
+  }
+
+  // ------------------------------------------------------------ live status
+  let lastLogStatus = null; // cached from 'log-status' bus events
+
+  function rconStatus() {
+    try {
+      const s = rcon ? rcon.status : null;
+      if (!s) return null;
+      return {
+        connected: !!s.connected, authed: !!s.authed,
+        lastError: s.lastError == null ? null : scrubText(String(s.lastError)),
+        since: s.since == null ? null : s.since,
+      };
+    } catch (_e) { return null; }
+  }
+  function logStatusOut() {
+    if (lastLogStatus) return scrubDeep(lastLogStatus);
+    return { mode: (cfg.log && cfg.log.mode) || 'local', ok: null };
+  }
+  function statusPayload() { return { rcon: rconStatus(), log: logStatusOut() }; }
+  function snapshot() {
+    try { return state && typeof state.snapshot === 'function' ? state.snapshot() : null; }
+    catch (_e) { return null; }
+  }
+  function liveDbIdSet() {
+    const set = new Set();
+    try {
+      if (state && state.players && typeof state.players.values === 'function') {
+        for (const rec of state.players.values()) {
+          if (rec && Number.isInteger(Number(rec.dbId)) && rec.dbId) set.add(Number(rec.dbId));
+        }
+      }
+    } catch (_e) { /* state unavailable */ }
+    return set;
+  }
+
+  // -------------------------------------------------------- request helpers
+  function clientIp(req) {
+    if (trustProxy) {
+      const xff = req.headers['x-forwarded-for'];
+      if (xff) {
+        const parts = String(xff).split(',');
+        const last = parts[parts.length - 1].trim();
+        if (last) return last; // last X-Forwarded-For hop (§19.3.19)
+      }
+    }
+    return (req.socket && req.socket.remoteAddress) || '';
+  }
+  function cookieSecure(req) {
+    if (web.secureCookies === true) return true;
+    if (web.secureCookies === false) return false;
+    // "auto": Secure iff TLS socket or trusted x-forwarded-proto: https (§2, §19.3.19)
+    if (req.socket && req.socket.encrypted) return true;
+    if (trustProxy) {
+      const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+      if (proto === 'https') return true;
+    }
+    return false;
+  }
+  function setSessionCookie(res, req, token, maxAge) {
+    const ma = maxAge == null ? COOKIE_MAX_AGE : maxAge;
+    let c = `${COOKIE_NAME}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${ma}`;
+    if (cookieSecure(req)) c += '; Secure';
+    const prev = res.getHeader('Set-Cookie');
+    res.setHeader('Set-Cookie', prev ? [].concat(prev, c) : c);
+  }
+  function getCookie(req, name) {
+    const h = req.headers.cookie;
+    if (!h) return null;
+    for (const part of String(h).split(';')) {
+      const i = part.indexOf('=');
+      if (i < 0) continue;
+      if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+    }
+    return null;
+  }
+  function json(res, status, obj) {
+    if (res.headersSent) { try { res.end(); } catch (_e) { /* gone */ } return; }
+    const body = JSON.stringify(obj == null ? {} : obj);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    if (status === 413) res.setHeader('Connection', 'close');
+    res.statusCode = status;
+    res.end(body);
+  }
+
+  // §19.3.20 — exact CSRF algorithm. Returns null when OK, else a reason.
+  function csrfCheck(req) {
+    let v = req.headers.origin;
+    if (v == null || v === '') v = req.headers.referer;
+    if (v == null || v === '') return 'missing Origin/Referer header';
+    if (v === 'null') return "Origin 'null' rejected";
+    let host;
+    try { host = new URL(String(v)).host; } catch (_e) { return 'malformed Origin/Referer'; }
+    if (host && host === req.headers.host) return null;
+    if (web.publicUrl) {
+      try { if (host && host === new URL(String(web.publicUrl)).host) return null; } catch (_e) { /* bad publicUrl */ }
+    }
+    return 'cross-origin request rejected';
+  }
+  function isJsonContentType(req) {
+    const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    return ct === 'application/json';
+  }
+  function readBody(req) {
+    return new Promise((resolve, reject) => {
+      const cl = Number(req.headers['content-length']);
+      if (Number.isFinite(cl) && cl > BODY_LIMIT) { reject(new ApiErr(413, 'body too large (64KB max)')); return; }
+      let size = 0;
+      let done = false;
+      const chunks = [];
+      req.on('data', (c) => {
+        if (done) return;
+        size += c.length;
+        if (size > BODY_LIMIT) { done = true; reject(new ApiErr(413, 'body too large (64KB max)')); return; }
+        chunks.push(c);
+      });
+      req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks)); } });
+      req.on('error', (e) => { if (!done) { done = true; reject(e); } });
+    });
+  }
+
+  // §19.3.21 — pagination clamps.
+  function pageOf(q, defPer) {
+    const per = clampInt(q.get('per'), 1, 200, defPer == null ? 50 : defPer);
+    const page = clampInt(q.get('page'), 0, 1000000, 0);
+    return { per, page, offset: page * per };
+  }
+  // §19.3.21 — "[all]" lists: LIMIT 2000 + total + truncated.
+  function cappedAll(rowsSql, countSql, params, mapRow) {
+    const rows = db.prepare(`${rowsSql} LIMIT ${CAP}`).all(...params);
+    const crow = db.prepare(countSql).get(...params);
+    const total = crow ? Number(crow.c) : rows.length;
+    return { total, truncated: total > rows.length, rows: mapRow ? rows.map(mapRow) : rows };
+  }
+
+  function intParam(v, name) {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0 || n > 999999999) throw new ApiErr(400, `invalid ${name}`);
+    return n;
+  }
+  function strBody(v, name, { max = 480, required = true } = {}) {
+    if (v == null || v === '') {
+      if (required) throw new ApiErr(400, `${name} required`);
+      return null;
+    }
+    if (typeof v !== 'string') throw new ApiErr(400, `${name} must be a string`);
+    return v.slice(0, max);
+  }
+
+  // viewer intel exclusion (§19.3.23): admin-channel chat is excluded from
+  // every viewer-facing read. `alias` is the chat table alias in the query.
+  function viewerChatCond(user, alias) {
+    if (auth.can(user, 'adminChat')) return '';
+    return ` AND (${alias}.channel IS NULL OR ${alias}.channel <> 'admin')`;
+  }
+
+  // ------------------------------------------------------------ row mappers
+  function killRow(r) {
+    return {
+      id: r.id, time: r.time, matchId: r.match_id, kind: r.kind,
+      attacker: (r.attacker_id != null || r.attacker_name != null)
+        ? { id: r.attacker_id, name: r.attacker_name } : null,
+      victim: (r.victim_id != null || r.victim_name != null)
+        ? { id: r.victim_id, name: r.victim_name } : null,
+      weapon: r.weapon, damage: r.damage, teamkill: !!r.teamkill, suicide: !!r.suicide,
+    };
+  }
+  const KILL_SELECT = `SELECT k.id, k.time, k.match_id, k.kind, k.weapon, k.damage, k.teamkill, k.suicide,
+      k.attacker_id, a.name AS attacker_name, k.victim_id, v.name AS victim_name
+    FROM kills k LEFT JOIN players a ON a.id = k.attacker_id LEFT JOIN players v ON v.id = k.victim_id`;
+
+  function chatRow(r) {
+    return {
+      id: r.id, time: r.time, matchId: r.match_id, channel: r.channel,
+      player: { id: r.player_id, name: r.player_name }, message: r.message,
+    };
+  }
+  function flagRow(r) {
+    return {
+      id: r.id, playerId: r.player_id, playerName: r.player_name == null ? null : r.player_name,
+      time: r.time, type: r.type, severity: r.severity, matchId: r.match_id,
+      details: parseDetails(r.details), reviewed: !!r.reviewed,
+      reviewedBy: r.reviewed_by == null ? null : r.reviewed_by,
+      reviewedAt: r.reviewed_at == null ? null : r.reviewed_at,
+      reviewNote: r.review_note == null ? null : r.review_note,
+    };
+  }
+  function banRow(nowT) {
+    return (r) => ({
+      id: r.id, playerId: r.player_id,
+      playerName: r.player_name == null ? null : r.player_name,
+      steamId: r.steam_id || r.p_steam || null,
+      issuedBy: r.issued_by, issuer: r.issuer == null ? null : r.issuer,
+      issuedAt: r.issued_at, durationSec: r.duration_sec, expiresAt: r.expires_at,
+      reason: r.reason, intervalRaw: r.interval_raw, active: !!r.active,
+      expired: r.expires_at != null && r.expires_at <= nowT,
+      rconOk: r.rcon_ok == null ? null : !!r.rcon_ok,
+      unbannedBy: r.unbanned_by == null ? null : r.unbanned_by,
+      unbannedAt: r.unbanned_at == null ? null : r.unbanned_at,
+    });
+  }
+  function matchRowMap(r) {
+    return {
+      id: r.id, layer: r.layer, level: r.level, layerClass: r.layer_class,
+      team1: r.team1, team2: r.team2, startedAt: r.started_at,
+      inProgressAt: r.in_progress_at, endedAt: r.ended_at,
+      winnerTeam: r.winner_team, winnerFaction: r.winner_faction, tickets: r.tickets,
+    };
+  }
+  function deployableRowMap(r) {
+    return {
+      id: r.id, matchId: r.match_id, time: r.time,
+      playerId: r.player_id, playerName: r.player_name == null ? null : r.player_name,
+      playerTeam: r.player_team, deployable: r.deployable, category: r.category,
+      depFaction: r.dep_faction, friendly: r.friendly, damage: r.damage,
+      weapon: r.weapon, damageType: r.damage_type, healthRemaining: r.health_remaining,
+    };
+  }
+  function playerFullMap(r) {
+    return {
+      id: r.id, eosId: r.eos_id, steamId: r.steam_id, name: r.name,
+      firstSeen: r.first_seen, lastSeen: r.last_seen, playSeconds: r.play_seconds,
+      kills: r.kills, deaths: r.deaths, teamkills: r.teamkills, tkDeaths: r.tk_deaths,
+      suicides: r.suicides, revivesGiven: r.revives_given, revivesTaken: r.revives_taken,
+      radioDamageFriendly: r.radio_damage_friendly, radioDamageEnemy: r.radio_damage_enemy,
+      habDamageFriendly: r.hab_damage_friendly, habDamageEnemy: r.hab_damage_enemy,
+      deployableDamageUnknown: r.deployable_damage_unknown,
+      avatar: r.avatar, watchlisted: !!r.watchlisted,
+    };
+  }
+
+  // ------------------------------------------------------------------- SSE
+  // §19.3.22: ONE bus listener per event type fanning out to a Set of client
+  // responses; max 4 streams/user, 64 global; ': ping' heartbeat every 25s;
+  // drop on write error/backpressure; viewers never get admin-channel chat
+  // or ADMIN_CAM data.
+  const sse = {
+    clients: new Set(), // { res, user }
+    perUser: new Map(), // userId -> live stream count
+    lastPlayersSent: 0,
+    playersTimer: null,
+    pingTimer: null,
+  };
+  function dropClient(client) {
+    if (!sse.clients.has(client)) return;
+    sse.clients.delete(client);
+    const uid = client.user.id;
+    const n = (sse.perUser.get(uid) || 1) - 1;
+    if (n <= 0) sse.perUser.delete(uid); else sse.perUser.set(uid, n);
+    try { client.res.end(); } catch (_e) { /* already gone */ }
+  }
+  function sseWrite(client, text) {
+    try {
+      if (!client.res.write(text)) dropClient(client); // backpressure -> drop
+    } catch (_e) {
+      dropClient(client);
+    }
+  }
+  function allowedFor(client, event, data) {
+    if (client.user.role !== 'viewer') return true;
+    if (event === 'chat' && data && data.channel === 'admin') return false;
+    if (data && data.kind === 'ADMIN_CAM') return false;
+    return true;
+  }
+  function sseBroadcast(event, data) {
+    if (sse.clients.size === 0) return;
+    for (const client of [...sse.clients]) {
+      if (!allowedFor(client, event, data)) continue;
+      sseWrite(client, `event: ${event}\ndata: ${JSON.stringify(data == null ? null : data)}\n\n`);
+    }
+  }
+  function sendPlayersSnapshot() {
+    sse.lastPlayersSent = Date.now();
+    sseBroadcast('players', snapshot());
+  }
+  function schedulePlayersSnapshot() {
+    if (sse.clients.size === 0) return;
+    const since = Date.now() - sse.lastPlayersSent;
+    if (since >= 5000) { sendPlayersSnapshot(); return; }
+    if (sse.playersTimer) return;
+    sse.playersTimer = setTimeout(() => {
+      sse.playersTimer = null;
+      sendPlayersSnapshot();
+    }, 5000 - since);
+  }
+
+  const busWiring = [
+    ['kill', (p) => sseBroadcast('kill', p)],
+    ['chat', (p) => sseBroadcast('chat', p)],
+    ['deployable', (p) => sseBroadcast('deployable', p)],
+    ['flag', (p) => sseBroadcast('flag', p)],
+    ['revive', (p) => sseBroadcast('revive', p)], // §19.1.6
+    ['player-connected', (p) => sseBroadcast('connect', p)],
+    ['player-disconnected', (p) => sseBroadcast('disconnect', p)],
+    ['players-updated', () => schedulePlayersSnapshot()],
+    ['match-start', (p) => sseBroadcast('match', Object.assign({ type: 'start' }, p))],
+    ['match-end', (p) => sseBroadcast('match', Object.assign({ type: 'end' }, p))],
+    ['match-state', (p) => sseBroadcast('match', Object.assign({ type: 'state' }, p))],
+    ['serverinfo-updated', (p) => sseBroadcast('serverinfo', p || (state && state.serverInfo) || null)],
+    ['tick-rate', (p) => sseBroadcast('tick', p)],
+    ['rcon-status', () => sseBroadcast('status', statusPayload())],
+    ['log-status', (s) => { lastLogStatus = s; sseBroadcast('status', statusPayload()); }],
+    ['broadcast', (p) => sseBroadcast('broadcast', p)],
+    ['pop-sample', (p) => sseBroadcast('pop', p)],
+  ];
+  if (bus) for (const [ev, fn] of busWiring) bus.on(ev, fn);
+
+  sse.pingTimer = setInterval(() => {
+    for (const client of [...sse.clients]) sseWrite(client, ': ping\n\n');
+  }, 25000);
+  if (typeof sse.pingTimer.unref === 'function') sse.pingTimer.unref();
+
+  function hStream(ctx) {
+    const uid = ctx.user.id;
+    const cur = sse.perUser.get(uid) || 0;
+    if (cur >= 4 || sse.clients.size >= 64) {
+      return json(ctx.res, 503, { error: 'too many concurrent streams' });
+    }
+    const res = ctx.res;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write(`event: hello\ndata: ${JSON.stringify({ snapshot: snapshot(), me: ctx.user })}\n\n`);
+    const client = { res, user: ctx.user };
+    sse.clients.add(client);
+    sse.perUser.set(uid, cur + 1);
+    ctx.req.on('close', () => dropClient(client));
+  }
+
+  // ---------------------------------------------------------- auth handlers
+  function hLogin(ctx) {
+    const lim = auth.loginLimiter.attempt(ctx.ip);
+    if (!lim.ok) {
+      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
+      return json(ctx.res, 429, { error: 'too many login attempts — try again shortly' });
+    }
+    const username = strBody(ctx.body.username, 'username', { max: 64 });
+    const password = strBody(ctx.body.password, 'password', { max: 1024 });
+    const user = auth.verifyLogin(username, password);
+    if (!user) return json(ctx.res, 401, { error: 'invalid username or password' });
+    auth.loginLimiter.reset(ctx.ip);
+    const sess = auth.createSession(user.id, {
+      ip: ctx.ip, ua: String(ctx.req.headers['user-agent'] || '').slice(0, 256),
+    });
+    setSessionCookie(ctx.res, ctx.req, sess.token);
+    return json(ctx.res, 200, { ok: true, user });
+  }
+  function hLogout(ctx) {
+    if (ctx.token) auth.destroySession(ctx.token);
+    setSessionCookie(ctx.res, ctx.req, '', 0);
+    return json(ctx.res, 200, { ok: true });
+  }
+  function hBootstrap(ctx) {
+    const out = {
+      needsSetup: auth.needsSetup(),
+      serverName: (state && state.serverInfo && state.serverInfo.serverName) || null,
+      version: version == null ? null : version,
+    };
+    // §19.3.15: in --demo mode ONLY, bootstrap returns the setup token.
+    if (cfg.demo === true && out.needsSetup && auth.setupToken) out.setupToken = auth.setupToken;
+    return json(ctx.res, 200, out);
+  }
+  function hSetup(ctx) {
+    const lim = auth.loginLimiter.attempt(ctx.ip); // rate-limited like login (§19.3.15)
+    if (!lim.ok) {
+      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
+      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
+    }
+    const username = strBody(ctx.body.username, 'username', { max: 64 });
+    const password = strBody(ctx.body.password, 'password', { max: 1024 });
+    const token = strBody(ctx.body.setupToken, 'setupToken', { max: 256 });
+    if (!auth.needsSetup()) return json(ctx.res, 403, { error: 'setup already completed' });
+    if (!auth.verifySetupToken(token)) {
+      return json(ctx.res, 403, { error: 'invalid setup token (printed in the server console at boot)' });
+    }
+    let user;
+    try {
+      user = auth.createFirstOwner({ username, password });
+    } catch (e) {
+      return json(ctx.res, 400, { error: e.message });
+    }
+    auth.audit(user.id, 'setup', { details: { username: user.username, role: 'owner' } });
+    auth.loginLimiter.reset(ctx.ip);
+    return json(ctx.res, 200, { ok: true });
+  }
+  function hMe(ctx) { return json(ctx.res, 200, { user: ctx.user }); }
+
+  // ---------------------------------------------------------- data handlers
+  function hOverview(ctx) {
+    const nowT = Date.now();
+    const dayStart = utcDayStart(nowT);
+    const count = (sql, ...p) => { const r = db.prepare(sql).get(...p); return r ? Number(r.c) : 0; };
+    const counters = {
+      playersTotal: count('SELECT COUNT(*) AS c FROM players'),
+      matchesTotal: count('SELECT COUNT(*) AS c FROM matches'),
+      flagsOpen: count('SELECT COUNT(*) AS c FROM flags WHERE reviewed = 0'),
+      bansActive: count('SELECT COUNT(*) AS c FROM bans WHERE active = 1 AND (expires_at IS NULL OR expires_at > ?)', nowT),
+      // §19.1.7
+      tksToday: count("SELECT COUNT(*) AS c FROM kills WHERE teamkill = 1 AND kind = 'wound' AND time >= ?", dayStart),
+    };
+    const kills = db.prepare(`${KILL_SELECT} WHERE k.kind = 'wound' ORDER BY k.id DESC LIMIT 25`).all().map(killRow);
+    const chat = db.prepare(
+      `SELECT c.id, c.time, c.match_id, c.channel, c.message, c.player_id, p.name AS player_name
+         FROM chat c LEFT JOIN players p ON p.id = c.player_id
+        WHERE 1=1${viewerChatCond(ctx.user, 'c')} ORDER BY c.id DESC LIMIT 25`
+    ).all().map(chatRow);
+    const flags = db.prepare(
+      `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
+        WHERE f.reviewed = 0 ORDER BY f.id DESC LIMIT 10`
+    ).all().map(flagRow);
+    return json(ctx.res, 200, {
+      status: {
+        rcon: rconStatus(), log: logStatusOut(),
+        tickRate: state && state.tickRate != null ? state.tickRate : null,
+        serverInfo: (state && state.serverInfo) || null,
+      },
+      snapshot: snapshot(),
+      counters,
+      recent: { kills, chat, flags },
+    });
+  }
+
+  function hPop(ctx) {
+    const hours = clampInt(ctx.query.get('hours'), 1, 720, 24); // §19.3.21
+    const since = Date.now() - hours * 3600 * 1000;
+    const rows = db.prepare(
+      'SELECT time, players, queue, tick_rate FROM pop_samples WHERE time >= ? ORDER BY time'
+    ).all(since);
+    return json(ctx.res, 200, { samples: rows.map((r) => [r.time, r.players, r.queue, r.tick_rate]) });
+  }
+
+  function hPlayers(ctx) {
+    const q = ctx.query;
+    const sortKey = q.get('sort') || 'last_seen';
+    const sortCol = PLAYER_SORT[sortKey];
+    if (!sortCol) throw new ApiErr(400, 'unknown sort key');
+    const dirKey = (q.get('dir') || 'desc').toLowerCase();
+    const dir = SORT_DIR[dirKey];
+    if (!dir) throw new ApiErr(400, 'unknown sort direction');
+    const filter = q.get('filter') || '';
+    if (filter && !PLAYER_FILTERS.has(filter)) throw new ApiErr(400, 'unknown filter');
+    const { per, offset } = pageOf(q, 50);
+    const nowT = Date.now();
+    const where = [];
+    const whereParams = [];
+    const qstr = (q.get('q') || '').trim().slice(0, 128);
+    if (qstr) {
+      where.push("(p.name LIKE ? ESCAPE '\\' OR p.steam_id = ? OR p.eos_id = ?)");
+      whereParams.push(`%${likeEscape(qstr)}%`, qstr, qstr.toLowerCase());
+    }
+    const liveIds = filter === 'online' ? [...liveDbIdSet()] : null;
+    if (filter === 'online') {
+      if (!liveIds.length) return json(ctx.res, 200, { total: 0, rows: [] });
+      where.push(`p.id IN (${liveIds.map(() => '?').join(',')})`);
+      whereParams.push(...liveIds);
+    } else if (filter === 'flagged') {
+      where.push('EXISTS(SELECT 1 FROM flags f WHERE f.player_id = p.id AND f.reviewed = 0)');
+    } else if (filter === 'watchlisted') {
+      where.push('p.watchlisted = 1');
+    } else if (filter === 'banned') {
+      where.push('EXISTS(SELECT 1 FROM bans b WHERE b.player_id = p.id AND b.active = 1 AND (b.expires_at IS NULL OR b.expires_at > ?))');
+      whereParams.push(nowT);
+    }
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const rows = db.prepare(
+      `SELECT p.id, p.name, p.eos_id, p.steam_id, p.last_seen, p.first_seen, p.play_seconds,
+              p.kills, p.deaths, p.teamkills, p.tk_deaths,
+              p.radio_damage_friendly, p.hab_damage_friendly, p.watchlisted,
+              (SELECT COUNT(*) FROM flags f WHERE f.player_id = p.id AND f.reviewed = 0) AS flags_open,
+              EXISTS(SELECT 1 FROM bans b WHERE b.player_id = p.id AND b.active = 1
+                     AND (b.expires_at IS NULL OR b.expires_at > ?)) AS banned_active
+         FROM players p${whereSql}
+        ORDER BY p.${sortCol} ${dir}, p.id DESC LIMIT ? OFFSET ?`
+    ).all(nowT, ...whereParams, per, offset);
+    const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM players p${whereSql}`).get(...whereParams);
+    const liveSet = liveDbIdSet();
+    return json(ctx.res, 200, {
+      total: totalRow ? Number(totalRow.c) : 0,
+      rows: rows.map((r) => ({
+        id: r.id, name: r.name, eosId: r.eos_id, steamId: r.steam_id,
+        lastSeen: r.last_seen, firstSeen: r.first_seen, playSeconds: r.play_seconds,
+        kills: r.kills, deaths: r.deaths, teamkills: r.teamkills, tkDeaths: r.tk_deaths,
+        radioFriendly: r.radio_damage_friendly, habFriendly: r.hab_damage_friendly,
+        flagsOpen: r.flags_open, online: liveSet.has(r.id),
+        watchlisted: !!r.watchlisted, bannedActive: !!r.banned_active,
+      })),
+    });
+  }
+
+  function hPlayer(ctx) {
+    const id = intParam(ctx.params[1], 'player id');
+    const row = db.prepare('SELECT * FROM players WHERE id = ?').get(id);
+    if (!row) throw new ApiErr(404, 'player not found');
+    const isAdmin = auth.can(ctx.user, 'ips');
+    const liveSet = liveDbIdSet();
+    const online = liveSet.has(id);
+    const openSession = db.prepare(
+      'SELECT id, connect_at FROM sessions WHERE player_id = ? AND disconnect_at IS NULL ORDER BY id DESC LIMIT 1'
+    ).get(id);
+    const out = {
+      player: playerFullMap(row),
+      names: db.prepare(
+        'SELECT name, first_used, last_used FROM player_names WHERE player_id = ? ORDER BY last_used DESC LIMIT 2000'
+      ).all(id).map((r) => ({ name: r.name, firstUsed: r.first_used, lastUsed: r.last_used })),
+      online,
+      session: openSession ? { id: openSession.id, connectAt: openSession.connect_at } : null,
+      sessions: db.prepare(
+        'SELECT id, connect_at, disconnect_at FROM sessions WHERE player_id = ? ORDER BY id DESC LIMIT 50'
+      ).all(id).map((r) => ({ id: r.id, connectAt: r.connect_at, disconnectAt: r.disconnect_at })),
+      matches: db.prepare(
+        `SELECT mp.match_id, m.layer, m.started_at, mp.team_id, mp.kills, mp.deaths,
+                mp.teamkills, mp.revives, mp.damage_dealt
+           FROM match_players mp JOIN matches m ON m.id = mp.match_id
+          WHERE mp.player_id = ? ORDER BY m.started_at DESC LIMIT 2000`
+      ).all(id).map((r) => ({
+        matchId: r.match_id, layer: r.layer, startedAt: r.started_at, teamId: r.team_id,
+        kills: r.kills, deaths: r.deaths, teamkills: r.teamkills, revives: r.revives, damage: r.damage_dealt,
+      })),
+      recentKills: db.prepare(
+        `${KILL_SELECT} WHERE k.attacker_id = ? AND k.kind = 'wound' ORDER BY k.id DESC LIMIT 50`
+      ).all(id).map(killRow),
+      recentDeaths: db.prepare(
+        `${KILL_SELECT} WHERE k.victim_id = ? AND k.kind = 'wound' ORDER BY k.id DESC LIMIT 50`
+      ).all(id).map(killRow),
+      // §19.3.21 — "[all]" lists are capped + wrapped.
+      tkIncidents: cappedAll(
+        `${KILL_SELECT} WHERE k.teamkill = 1 AND k.kind = 'wound' AND (k.attacker_id = ? OR k.victim_id = ?) ORDER BY k.time DESC`,
+        "SELECT COUNT(*) AS c FROM kills k WHERE k.teamkill = 1 AND k.kind = 'wound' AND (k.attacker_id = ? OR k.victim_id = ?)",
+        [id, id], killRow
+      ),
+      deployableDamage: cappedAll(
+        `SELECT d.*, NULL AS player_name FROM deployable_damage d WHERE d.player_id = ? ORDER BY d.time DESC`,
+        'SELECT COUNT(*) AS c FROM deployable_damage d WHERE d.player_id = ?',
+        [id], deployableRowMap
+      ),
+      chatCount: (() => {
+        const r = db.prepare(`SELECT COUNT(*) AS c FROM chat c WHERE c.player_id = ?${viewerChatCond(ctx.user, 'c')}`).get(id);
+        return r ? Number(r.c) : 0;
+      })(),
+      flags: db.prepare(
+        'SELECT f.*, NULL AS player_name FROM flags f WHERE f.player_id = ? ORDER BY f.id DESC LIMIT 2000'
+      ).all(id).map(flagRow),
+      warnings: db.prepare(
+        `SELECT w.id, w.player_id, w.by_user, w.time, w.message, w.auto, u.username AS by_username
+           FROM warnings w LEFT JOIN users u ON u.id = w.by_user
+          WHERE w.player_id = ? ORDER BY w.id DESC LIMIT 2000`
+      ).all(id).map((r) => ({
+        id: r.id, playerId: r.player_id, byUser: r.by_user, byUsername: r.by_username == null ? null : r.by_username,
+        time: r.time, message: r.message, auto: !!r.auto,
+      })),
+      bans: db.prepare(
+        `SELECT b.*, NULL AS player_name, NULL AS p_steam, u.username AS issuer
+           FROM bans b LEFT JOIN users u ON u.id = b.issued_by
+          WHERE b.player_id = ? ORDER BY b.id DESC LIMIT 2000`
+      ).all(id).map(banRow(Date.now())),
+      notes: db.prepare(
+        `SELECT n.id, n.player_id, n.by_user, n.time, n.text, u.username AS by_username
+           FROM player_notes n LEFT JOIN users u ON u.id = n.by_user
+          WHERE n.player_id = ? ORDER BY n.id DESC LIMIT 2000`
+      ).all(id).map((r) => ({
+        id: r.id, playerId: r.player_id, byUser: r.by_user, byUsername: r.by_username == null ? null : r.by_username,
+        time: r.time, text: r.text,
+      })),
+    };
+    if (isAdmin) {
+      // IPs exist ONLY here, for admin+ (§19.1.1, §19.3.23).
+      out.ips = db.prepare(
+        'SELECT ip, first_seen, last_seen, times FROM player_ips WHERE player_id = ? ORDER BY last_seen DESC LIMIT 2000'
+      ).all(id).map((r) => ({ ip: r.ip, firstSeen: r.first_seen, lastSeen: r.last_seen, times: r.times }));
+      out.alts = db.prepare(
+        `SELECT p2.id AS player_id, p2.name, COUNT(DISTINCT i2.ip) AS shared
+           FROM player_ips i1
+           JOIN player_ips i2 ON i2.ip = i1.ip AND i2.player_id <> i1.player_id
+           JOIN players p2 ON p2.id = i2.player_id
+          WHERE i1.player_id = ?
+          GROUP BY p2.id, p2.name ORDER BY shared DESC, p2.id LIMIT 50`
+      ).all(id).map((r) => ({ playerId: r.player_id, name: r.name, sharedIps: Number(r.shared) }));
+    }
+    return json(ctx.res, 200, out);
+  }
+
+  function hPlayerChat(ctx) {
+    const id = intParam(ctx.params[1], 'player id');
+    const { per, offset } = pageOf(ctx.query, 100);
+    const cond = viewerChatCond(ctx.user, 'c');
+    const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM chat c WHERE c.player_id = ?${cond}`).get(id);
+    const rows = db.prepare(
+      `SELECT c.id, c.time, c.match_id, c.channel, c.message, c.player_id, p.name AS player_name
+         FROM chat c LEFT JOIN players p ON p.id = c.player_id
+        WHERE c.player_id = ?${cond} ORDER BY c.id DESC LIMIT ? OFFSET ?`
+    ).all(id, per, offset);
+    return json(ctx.res, 200, { total: totalRow ? Number(totalRow.c) : 0, rows: rows.map(chatRow) });
+  }
+
+  function hNoteAdd(ctx) {
+    const id = intParam(ctx.params[1], 'player id');
+    if (!db.prepare('SELECT id FROM players WHERE id = ?').get(id)) throw new ApiErr(404, 'player not found');
+    const text = strBody(ctx.body.text, 'text', { max: 2000 });
+    const t = Date.now();
+    const r = db.prepare('INSERT INTO player_notes(player_id, by_user, time, text) VALUES(?,?,?,?)')
+      .run(id, ctx.user.id, t, text);
+    auth.audit(ctx.user.id, 'note', { targetPlayerId: id, details: { noteId: r.lastInsertRowid } });
+    return json(ctx.res, 200, {
+      ok: true,
+      note: { id: r.lastInsertRowid, playerId: id, byUser: ctx.user.id, byUsername: ctx.user.username, time: t, text },
+    });
+  }
+
+  function hWatch(ctx) {
+    const id = intParam(ctx.params[1], 'player id');
+    const on = ctx.body.on === true || ctx.body.on === 1;
+    const r = db.prepare('UPDATE players SET watchlisted = ? WHERE id = ?').run(on ? 1 : 0, id);
+    if (r.changes === 0) throw new ApiErr(404, 'player not found');
+    auth.audit(ctx.user.id, 'watch', { targetPlayerId: id, details: { on } });
+    return json(ctx.res, 200, { ok: true });
+  }
+
+  function hManualFlag(ctx) {
+    const id = intParam(ctx.params[1], 'player id');
+    if (!db.prepare('SELECT id FROM players WHERE id = ?').get(id)) throw new ApiErr(404, 'player not found');
+    const raw = ctx.body.details;
+    const text = typeof raw === 'string' ? raw.slice(0, 2000)
+      : (raw == null ? '' : JSON.stringify(raw).slice(0, 2000));
+    if (!text) throw new ApiErr(400, 'details required');
+    const t = Date.now();
+    const matchId = state && state.match && state.match.id != null ? state.match.id : null;
+    const details = { text, by: ctx.user.username };
+    let flagId = null;
+    if (ingest && typeof ingest.insertFlag === 'function') {
+      flagId = ingest.insertFlag({ type: 'manual', severity: 2, playerDbId: id, rec: null, matchId, time: t, details });
+    } else {
+      const r = db.prepare('INSERT INTO flags(player_id, time, type, severity, match_id, details) VALUES(?,?,?,?,?,?)')
+        .run(id, t, 'manual', 2, matchId, JSON.stringify(details));
+      flagId = r.lastInsertRowid;
+      if (bus) bus.emit('flag', { time: t, flagId, type: 'manual', severity: 2, player: { dbId: id }, matchId, details });
+    }
+    auth.audit(ctx.user.id, 'manual-flag', { targetPlayerId: id, details: { flagId, text } });
+    return json(ctx.res, 200, { ok: true, flagId });
+  }
+
+  function hMatches(ctx) {
+    const { per, offset } = pageOf(ctx.query, 50);
+    const totalRow = db.prepare('SELECT COUNT(*) AS c FROM matches').get();
+    const rows = db.prepare(
+      `SELECT m.*,
+              (SELECT COUNT(*) FROM match_players mp WHERE mp.match_id = m.id) AS player_count,
+              (SELECT COUNT(*) FROM kills k WHERE k.match_id = m.id AND k.kind = 'wound') AS kill_count,
+              (SELECT COUNT(*) FROM kills k WHERE k.match_id = m.id AND k.kind = 'wound' AND k.teamkill = 1) AS tk_count
+         FROM matches m ORDER BY m.id DESC LIMIT ? OFFSET ?`
+    ).all(per, offset);
+    return json(ctx.res, 200, {
+      total: totalRow ? Number(totalRow.c) : 0,
+      rows: rows.map((r) => Object.assign(matchRowMap(r), {
+        players: Number(r.player_count), kills: Number(r.kill_count), teamkills: Number(r.tk_count),
+      })),
+    });
+  }
+
+  function hMatch(ctx) {
+    const id = intParam(ctx.params[1], 'match id');
+    const m = db.prepare('SELECT * FROM matches WHERE id = ?').get(id);
+    if (!m) throw new ApiErr(404, 'match not found');
+    const scoreboard = db.prepare(
+      `SELECT mp.player_id, p.name, p.steam_id, mp.team_id, mp.kills, mp.deaths, mp.teamkills,
+              mp.tk_deaths, mp.revives, mp.damage_dealt
+         FROM match_players mp LEFT JOIN players p ON p.id = mp.player_id
+        WHERE mp.match_id = ? ORDER BY mp.team_id, mp.kills DESC, mp.player_id LIMIT 2000`
+    ).all(id).map((r) => ({
+      playerId: r.player_id, name: r.name, steamId: r.steam_id, teamId: r.team_id,
+      kills: r.kills, deaths: r.deaths, teamkills: r.teamkills, tkDeaths: r.tk_deaths,
+      revives: r.revives, damageDealt: r.damage_dealt,
+    }));
+    const kills = cappedAll(
+      `${KILL_SELECT} WHERE k.match_id = ? ORDER BY k.id`,
+      'SELECT COUNT(*) AS c FROM kills k WHERE k.match_id = ?',
+      [id], killRow
+    );
+    const deployables = db.prepare(
+      `SELECT d.*, p.name AS player_name FROM deployable_damage d
+         LEFT JOIN players p ON p.id = d.player_id
+        WHERE d.match_id = ? ORDER BY d.id LIMIT 2000`
+    ).all(id).map(deployableRowMap);
+    const chat = db.prepare(
+      `SELECT c.id, c.time, c.match_id, c.channel, c.message, c.player_id, p.name AS player_name
+         FROM chat c LEFT JOIN players p ON p.id = c.player_id
+        WHERE c.match_id = ?${viewerChatCond(ctx.user, 'c')} ORDER BY c.id LIMIT 2000`
+    ).all(id).map(chatRow);
+    const flags = db.prepare(
+      `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
+        WHERE f.match_id = ? ORDER BY f.id LIMIT 2000`
+    ).all(id).map(flagRow);
+    return json(ctx.res, 200, { match: matchRowMap(m), scoreboard, kills, deployables, chat, flags });
+  }
+
+  function hChat(ctx) {
+    const q = ctx.query;
+    const { per, offset } = pageOf(q, 100);
+    const where = [];
+    const params = [];
+    const qstr = (q.get('q') || '').trim().slice(0, 128);
+    if (qstr) { where.push("c.message LIKE ? ESCAPE '\\'"); params.push(`%${likeEscape(qstr)}%`); }
+    const channel = q.get('channel') || '';
+    if (channel) {
+      if (!CHAT_CHANNELS.has(channel)) throw new ApiErr(400, 'unknown channel');
+      if (channel === 'admin' && !auth.can(ctx.user, 'adminChat')) throw new ApiErr(403, 'forbidden');
+      where.push('c.channel = ?');
+      params.push(channel);
+    }
+    const pid = q.get('playerId');
+    if (pid != null && pid !== '') { where.push('c.player_id = ?'); params.push(intParam(pid, 'playerId')); }
+    let whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : ' WHERE 1=1';
+    whereSql += viewerChatCond(ctx.user, 'c');
+    const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM chat c${whereSql}`).get(...params);
+    const rows = db.prepare(
+      `SELECT c.id, c.time, c.match_id, c.channel, c.message, c.player_id, p.name AS player_name
+         FROM chat c LEFT JOIN players p ON p.id = c.player_id${whereSql}
+        ORDER BY c.id DESC LIMIT ? OFFSET ?`
+    ).all(...params, per, offset);
+    return json(ctx.res, 200, { total: totalRow ? Number(totalRow.c) : 0, rows: rows.map(chatRow) });
+  }
+
+  function hFlags(ctx) {
+    const key = ctx.query.get('reviewed') || 'all';
+    if (!(key in FLAGS_REVIEWED)) throw new ApiErr(400, 'reviewed must be 0, 1 or all');
+    const cond = FLAGS_REVIEWED[key];
+    const whereSql = cond ? ` WHERE ${cond}` : '';
+    const { per, offset } = pageOf(ctx.query, 50);
+    const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM flags f${whereSql}`).get();
+    const rows = db.prepare(
+      `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
+        ${whereSql} ORDER BY f.id DESC LIMIT ? OFFSET ?`
+    ).all(per, offset);
+    return json(ctx.res, 200, { total: totalRow ? Number(totalRow.c) : 0, rows: rows.map(flagRow) });
+  }
+
+  function hFlagReview(ctx) {
+    const id = intParam(ctx.params[1], 'flag id');
+    const flag = db.prepare('SELECT id, player_id FROM flags WHERE id = ?').get(id);
+    if (!flag) throw new ApiErr(404, 'flag not found');
+    const note = strBody(ctx.body.note, 'note', { max: 2000, required: false });
+    db.prepare('UPDATE flags SET reviewed = 1, reviewed_by = ?, reviewed_at = ?, review_note = ? WHERE id = ?')
+      .run(ctx.user.id, Date.now(), note, id);
+    auth.audit(ctx.user.id, 'flag-review', { targetPlayerId: flag.player_id, details: { flagId: id, note } });
+    return json(ctx.res, 200, { ok: true });
+  }
+
+  function hTrolls(ctx) {
+    const weekAgo = Date.now() - 7 * 86400 * 1000;
+    const lb = (allSql, weekSql) => ({
+      all: db.prepare(allSql).all().map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
+      week: db.prepare(weekSql).all(weekAgo).map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
+    });
+    // §19.1.8 — every leaderboard is {all, week}.
+    const leaderboards = {
+      teamkills: lb(
+        'SELECT id, name, teamkills AS value FROM players WHERE teamkills > 0 ORDER BY value DESC, id LIMIT 20',
+        `SELECT p.id, p.name, COUNT(*) AS value FROM kills k JOIN players p ON p.id = k.attacker_id
+          WHERE k.teamkill = 1 AND k.kind = 'wound' AND k.time >= ?
+          GROUP BY p.id, p.name ORDER BY value DESC, p.id LIMIT 20`
+      ),
+      radioFriendly: lb(
+        'SELECT id, name, radio_damage_friendly AS value FROM players WHERE radio_damage_friendly > 0 ORDER BY value DESC, id LIMIT 20',
+        `SELECT p.id, p.name, SUM(d.damage) AS value FROM deployable_damage d JOIN players p ON p.id = d.player_id
+          WHERE d.category = 'radio' AND d.friendly = 1 AND d.time >= ?
+          GROUP BY p.id, p.name ORDER BY value DESC, p.id LIMIT 20`
+      ),
+      tkDeaths: lb(
+        'SELECT id, name, tk_deaths AS value FROM players WHERE tk_deaths > 0 ORDER BY value DESC, id LIMIT 20',
+        `SELECT p.id, p.name, COUNT(*) AS value FROM kills k JOIN players p ON p.id = k.victim_id
+          WHERE k.teamkill = 1 AND k.kind = 'wound' AND k.time >= ?
+          GROUP BY p.id, p.name ORDER BY value DESC, p.id LIMIT 20`
+      ),
+      repeatOffenders: lb(
+        `SELECT p.id, p.name, COUNT(*) AS value FROM flags f JOIN players p ON p.id = f.player_id
+          GROUP BY p.id, p.name HAVING COUNT(*) >= 2 ORDER BY value DESC, p.id LIMIT 20`,
+        `SELECT p.id, p.name, COUNT(*) AS value FROM flags f JOIN players p ON p.id = f.player_id
+          WHERE f.time >= ? GROUP BY p.id, p.name HAVING COUNT(*) >= 2 ORDER BY value DESC, p.id LIMIT 20`
+      ),
+    };
+    const openFlags = db.prepare(
+      `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
+        WHERE f.reviewed = 0 ORDER BY f.severity DESC, f.id DESC LIMIT 50`
+    ).all().map(flagRow);
+    return json(ctx.res, 200, { openFlags, leaderboards });
+  }
+
+  function hLayers(ctx) {
+    return json(ctx.res, 200, {
+      layers: state && Array.isArray(state.layers) ? state.layers : [],
+      cachedAt: state && state.layersCachedAt != null ? state.layersCachedAt : null,
+    });
+  }
+
+  // -------------------------------------------------------------- bans
+  const BAN_SELECT = `SELECT b.*, p.name AS player_name, p.steam_id AS p_steam, u.username AS issuer
+      FROM bans b LEFT JOIN players p ON p.id = b.player_id LEFT JOIN users u ON u.id = b.issued_by`;
+
+  function hBansList(ctx) {
+    const key = ctx.query.get('active') || 'all';
+    if (!BANS_ACTIVE.has(key)) throw new ApiErr(400, 'active must be 1, 0 or all');
+    const nowT = Date.now();
+    let whereSql = '';
+    const params = [];
+    if (key === '1') {
+      whereSql = ' WHERE b.active = 1 AND (b.expires_at IS NULL OR b.expires_at > ?)';
+      params.push(nowT);
+    } else if (key === '0') {
+      whereSql = ' WHERE (b.active = 0 OR (b.expires_at IS NOT NULL AND b.expires_at <= ?))';
+      params.push(nowT);
+    }
+    const rows = db.prepare(`${BAN_SELECT}${whereSql} ORDER BY b.id DESC LIMIT 2000`).all(...params);
+    return json(ctx.res, 200, { rows: rows.map(banRow(nowT)) });
+  }
+
+  async function hBanCreate(ctx) {
+    const body = ctx.body;
+    const intervalStr = String(body.interval == null ? '' : body.interval).trim();
+    if (!INTERVAL_RE.test(intervalStr)) throw new ApiErr(400, 'invalid interval (use 0, or e.g. 1d 3d 1w 1M)');
+    const durationSec = parseInterval(intervalStr);
+    if (durationSec == null) throw new ApiErr(400, 'invalid interval');
+    const reason = sanitizeRconArg(body.reason == null ? '' : body.reason, 480);
+    let playerRow = null;
+    let steamIdParam = null;
+    if (body.playerId != null && body.playerId !== '') {
+      playerRow = db.prepare('SELECT * FROM players WHERE id = ?').get(intParam(body.playerId, 'playerId'));
+      if (!playerRow) throw new ApiErr(404, 'player not found');
+    } else if (body.steamId != null && body.steamId !== '') {
+      steamIdParam = String(body.steamId).trim();
+      if (!STEAM_ID_RE.test(steamIdParam)) throw new ApiErr(400, 'invalid steamId');
+      playerRow = db.prepare('SELECT * FROM players WHERE steam_id = ? ORDER BY last_seen DESC LIMIT 1').get(steamIdParam);
+      if (!playerRow) {
+        // §19.2.13: manual ban of a never-seen steamId -> stub players row.
+        const t = Date.now();
+        const ins = db.prepare('INSERT INTO players(steam_id, name, first_seen, last_seen) VALUES(?,?,?,?)')
+          .run(steamIdParam, '(manual ban)', t, t);
+        playerRow = db.prepare('SELECT * FROM players WHERE id = ?').get(ins.lastInsertRowid);
+      }
+    } else {
+      throw new ApiErr(400, 'playerId or steamId required');
+    }
+    const banSteamId = steamIdParam || playerRow.steam_id || null;
+    // RCON attempt (audited inside admin.js). Offline targets simply yield a
+    // "not found" style response -> rconOk=false, still recorded.
+    const rconRes = await admin.execAdmin(ctx.user, 'ban', {
+      playerId: playerRow.id,
+      steamId: steamIdParam || undefined,
+      interval: intervalStr,
+      reason: reason || 'Banned by admin',
+    });
+    const rconOk = rconRes.ok === true && rconRes.rconOk === true;
+    const nowT = Date.now();
+    const expiresAt = durationSec === 0 ? null : nowT + durationSec * 1000;
+    const ins = db.prepare(
+      `INSERT INTO bans(player_id, steam_id, issued_by, issued_at, duration_sec, expires_at, reason, interval_raw, active, rcon_ok)
+       VALUES(?,?,?,?,?,?,?,?,1,?)`
+    ).run(playerRow.id, banSteamId, ctx.user.id, nowT, durationSec, expiresAt,
+      reason || null, intervalStr, rconOk ? 1 : 0);
+    const ban = {
+      id: ins.lastInsertRowid, playerId: playerRow.id, playerName: playerRow.name,
+      steamId: banSteamId, issuedBy: ctx.user.id, issuer: ctx.user.username,
+      issuedAt: nowT, durationSec, expiresAt, reason: reason || null,
+      intervalRaw: intervalStr, active: true, rconOk,
+    };
+    return json(ctx.res, 200, {
+      ok: true, ban, rconOk,
+      rconResponse: rconRes.ok ? rconRes.response : (rconRes.error || null),
+    });
+  }
+
+  function hUnban(ctx) {
+    const id = intParam(ctx.params[1], 'ban id');
+    const row = db.prepare('SELECT * FROM bans WHERE id = ?').get(id);
+    if (!row) throw new ApiErr(404, 'ban not found');
+    if (row.active) {
+      db.prepare('UPDATE bans SET active = 0, unbanned_by = ?, unbanned_at = ? WHERE id = ?')
+        .run(ctx.user.id, Date.now(), id);
+    }
+    auth.audit(ctx.user.id, 'unban', { targetPlayerId: row.player_id, details: { banId: id } });
+    return json(ctx.res, 200, { ok: true, note: UNBAN_NOTE });
+  }
+
+  function hExportBans(ctx) {
+    const nowT = Date.now();
+    const rows = db.prepare(
+      `SELECT COALESCE(b.steam_id, p.steam_id) AS sid, b.expires_at, b.reason
+         FROM bans b LEFT JOIN players p ON p.id = b.player_id
+        WHERE b.active = 1 AND (b.expires_at IS NULL OR b.expires_at > ?) ORDER BY b.id`
+    ).all(nowT);
+    const lines = [];
+    for (const r of rows) {
+      if (!r.sid) continue; // no SteamID -> cannot appear in Bans.cfg
+      const expiry = r.expires_at != null ? Math.floor(r.expires_at / 1000) : 0;
+      const reason = String(r.reason == null ? '' : r.reason).replace(/[\r\n\0]/g, ' ');
+      lines.push(`${r.sid}:${expiry} //${reason}`);
+    }
+    const res = ctx.res;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Content-Disposition', 'attachment; filename="Bans.cfg"');
+    res.statusCode = 200;
+    res.end(lines.length ? lines.join('\n') + '\n' : '');
+  }
+
+  // ------------------------------------------------------- admin RCON routes
+  async function doAdmin(ctx, action, params) {
+    const r = await admin.execAdmin(ctx.user, action, params);
+    if (!r.ok && r.command == null) throw new ApiErr(400, r.error || 'invalid request'); // §19.3.17: pre-audit 400
+    if (!r.ok) throw new ApiErr(502, `RCON command failed: ${r.error || 'unknown error'}`);
+    return r;
+  }
+  async function hWarn(ctx) {
+    const playerId = intParam(ctx.body.playerId, 'playerId');
+    const message = strBody(ctx.body.message, 'message', { max: 480 });
+    const r = await doAdmin(ctx, 'warn', { playerId, message });
+    db.prepare('INSERT INTO warnings(player_id, by_user, time, message, auto) VALUES(?,?,?,?,0)')
+      .run(playerId, ctx.user.id, Date.now(), sanitizeRconArg(message, 480));
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hKick(ctx) {
+    const playerId = intParam(ctx.body.playerId, 'playerId');
+    const reason = strBody(ctx.body.reason, 'reason', { max: 480, required: false });
+    const r = await doAdmin(ctx, 'kick', { playerId, reason });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hBroadcast(ctx) {
+    const message = strBody(ctx.body.message, 'message', { max: 480 });
+    const r = await doAdmin(ctx, 'broadcast', { message });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hForceTeamChange(ctx) {
+    const r = await doAdmin(ctx, 'forceTeamChange', { playerId: intParam(ctx.body.playerId, 'playerId') });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hRemoveFromSquad(ctx) {
+    const r = await doAdmin(ctx, 'removeFromSquad', { playerId: intParam(ctx.body.playerId, 'playerId') });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hDisbandSquad(ctx) {
+    const r = await doAdmin(ctx, 'disbandSquad', { teamId: ctx.body.teamId, squadId: ctx.body.squadId });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hDemoteCommander(ctx) {
+    const r = await doAdmin(ctx, 'demoteCommander', { playerId: intParam(ctx.body.playerId, 'playerId') });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hChangeLayer(ctx) {
+    const layer = strBody(ctx.body.layer, 'layer', { max: 128 });
+    const r = await doAdmin(ctx, 'changeLayer', { layer, now: ctx.body.now === true });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hMatchOp(ctx) {
+    const op = String(ctx.body.op == null ? '' : ctx.body.op);
+    const action = MATCH_OPS[op];
+    if (!action) throw new ApiErr(400, "op must be 'restart' or 'end'");
+    const r = await doAdmin(ctx, action, {});
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hSlomo(ctx) {
+    const r = await doAdmin(ctx, 'slomo', { factor: ctx.body.factor });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+  }
+  async function hRaw(ctx) {
+    const command = strBody(ctx.body.command, 'command', { max: 480 });
+    const r = await admin.execRaw(ctx.user, command);
+    if (!r.ok && r.command == null) throw new ApiErr(400, r.error || 'invalid command');
+    if (!r.ok) throw new ApiErr(502, `RCON command failed: ${r.error || 'unknown error'}`);
+    return json(ctx.res, 200, { ok: true, response: r.response });
+  }
+
+  // ----------------------------------------------------------- audit, users
+  function hAudit(ctx) {
+    const q = ctx.query;
+    const { per, offset } = pageOf(q, 50);
+    const where = [];
+    const params = [];
+    const uid = q.get('userId');
+    if (uid != null && uid !== '') { where.push('a.user_id = ?'); params.push(intParam(uid, 'userId')); }
+    const action = q.get('action') || '';
+    if (action) {
+      if (!AUDIT_ACTIONS.has(action)) throw new ApiErr(400, 'unknown action'); // §19.3.16
+      where.push('a.action = ?');
+      params.push(action);
+    }
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM admin_actions a${whereSql}`).get(...params);
+    const rows = db.prepare(
+      `SELECT a.*, u.username, p.name AS target_name
+         FROM admin_actions a LEFT JOIN users u ON u.id = a.user_id
+         LEFT JOIN players p ON p.id = a.target_player_id
+        ${whereSql} ORDER BY a.id DESC LIMIT ? OFFSET ?`
+    ).all(...params, per, offset);
+    return json(ctx.res, 200, {
+      total: totalRow ? Number(totalRow.c) : 0,
+      rows: rows.map((r) => ({
+        id: r.id, time: r.time, userId: r.user_id,
+        username: r.username == null ? null : r.username,
+        action: r.action, targetPlayerId: r.target_player_id,
+        targetName: r.target_name == null ? null : r.target_name,
+        details: parseDetails(r.details),
+        rconCommand: r.rcon_command, rconResponse: r.rcon_response,
+        rconOk: r.rcon_ok == null ? null : !!r.rcon_ok,
+      })),
+    });
+  }
+
+  function hUsersList(ctx) {
+    const rows = db.prepare('SELECT id, username, role, created_at, last_login, disabled FROM users ORDER BY id').all();
+    return json(ctx.res, 200, {
+      rows: rows.map((r) => ({
+        id: r.id, username: r.username, role: r.role,
+        createdAt: r.created_at, lastLogin: r.last_login, disabled: !!r.disabled,
+      })),
+    });
+  }
+
+  function hUserCreate(ctx) {
+    const username = strBody(ctx.body.username, 'username', { max: 64 });
+    const password = strBody(ctx.body.password, 'password', { max: 1024 });
+    const role = String(ctx.body.role == null ? '' : ctx.body.role);
+    if (!['owner', 'admin', 'viewer'].includes(role)) throw new ApiErr(400, "role must be 'owner', 'admin' or 'viewer'");
+    let user;
+    try {
+      user = auth.createUser(username, password, role);
+    } catch (e) {
+      throw new ApiErr(400, e.message);
+    }
+    auth.audit(ctx.user.id, 'user-create', { details: { username: user.username, role } });
+    return json(ctx.res, 200, { ok: true, user });
+  }
+
+  function hUserUpdate(ctx) {
+    const id = intParam(ctx.params[1], 'user id');
+    const target = db.prepare('SELECT id, username, role, disabled FROM users WHERE id = ?').get(id);
+    if (!target) throw new ApiErr(404, 'user not found');
+    const body = ctx.body;
+    const sets = [];
+    const params = [];
+    const changed = [];
+    let newRole = null;
+    let newDisabled = null;
+    if (body.role !== undefined) {
+      newRole = String(body.role);
+      if (!['owner', 'admin', 'viewer'].includes(newRole)) throw new ApiErr(400, 'invalid role');
+      sets.push('role = ?'); params.push(newRole); changed.push('role');
+    }
+    if (body.disabled !== undefined) {
+      newDisabled = body.disabled === true || body.disabled === 1 ? 1 : 0;
+      sets.push('disabled = ?'); params.push(newDisabled); changed.push('disabled');
+    }
+    if (body.password !== undefined) {
+      const pw = strBody(body.password, 'password', { max: 1024 });
+      sets.push('pass_hash = ?'); params.push(auth.hashPassword(pw)); changed.push('password');
+    }
+    if (!sets.length) throw new ApiErr(400, 'nothing to update');
+    // Cannot demote (or disable) the last enabled owner (§13).
+    const losesOwner = target.role === 'owner' &&
+      ((newRole != null && newRole !== 'owner') || newDisabled === 1);
+    if (losesOwner) {
+      const others = db.prepare(
+        "SELECT COUNT(*) AS c FROM users WHERE role = 'owner' AND disabled = 0 AND id <> ?"
+      ).get(id);
+      if (!others || Number(others.c) === 0) throw new ApiErr(400, 'cannot demote or disable the last owner');
+    }
+    db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
+    auth.destroyUserSessions(id); // §19.3.18
+    auth.audit(ctx.user.id, 'user-update', { details: { userId: id, username: target.username, changed } });
+    return json(ctx.res, 200, { ok: true });
+  }
+
+  function hSettings(ctx) {
+    let sizeBytes = null;
+    const dbPath = (db && db.path) || cfg.dbPath || null;
+    try {
+      if (dbPath && dbPath !== ':memory:') sizeBytes = fs.statSync(path.resolve(String(dbPath))).size;
+    } catch (_e) { /* db file may not exist yet */ }
+    let samples = [];
+    try { samples = (ph.samples() || []).map((s) => scrubText(s)); } catch (_e) { samples = []; }
+    let unmatched24h = 0;
+    try { unmatched24h = Number(ph.count24h()) || 0; } catch (_e) { unmatched24h = 0; }
+    return json(ctx.res, 200, {
+      config: redactedConfig(), // §19.3.27
+      status: {
+        rcon: rconStatus(),
+        log: logStatusOut(),
+        db: { path: dbPath, sizeBytes },
+        parser: { unmatched24h, samples },
+        version: version == null ? null : version,
+        gameVersion: (state && state.serverInfo && state.serverInfo.gameVersion) || null, // §19.1.10
+      },
+    });
+  }
+
+  // -------------------------------------------------------------- the router
+  const routes = [];
+  function route(method, re, opts, handler) { routes.push({ method, re, opts: opts || {}, handler }); }
+
+  route('POST', /^\/api\/login$/, { public: true }, hLogin);
+  route('POST', /^\/api\/logout$/, { perm: 'view' }, hLogout);
+  route('GET', /^\/api\/bootstrap$/, { public: true }, hBootstrap);
+  route('POST', /^\/api\/setup$/, { public: true }, hSetup);
+  route('GET', /^\/api\/me$/, { perm: 'view' }, hMe);
+  route('GET', /^\/api\/overview$/, { perm: 'view' }, hOverview);
+  route('GET', /^\/api\/stream$/, { perm: 'view' }, hStream);
+  route('GET', /^\/api\/pop$/, { perm: 'view' }, hPop);
+  route('GET', /^\/api\/players$/, { perm: 'view' }, hPlayers);
+  route('GET', /^\/api\/players\/(\d+)$/, { perm: 'view' }, hPlayer);
+  route('GET', /^\/api\/players\/(\d+)\/chat$/, { perm: 'view' }, hPlayerChat);
+  route('POST', /^\/api\/players\/(\d+)\/notes$/, { perm: 'actions' }, hNoteAdd);
+  route('POST', /^\/api\/players\/(\d+)\/watch$/, { perm: 'actions' }, hWatch);
+  route('POST', /^\/api\/players\/(\d+)\/flag$/, { perm: 'actions' }, hManualFlag);
+  route('GET', /^\/api\/matches$/, { perm: 'view' }, hMatches);
+  route('GET', /^\/api\/matches\/(\d+)$/, { perm: 'view' }, hMatch);
+  route('GET', /^\/api\/chat$/, { perm: 'view' }, hChat);
+  route('GET', /^\/api\/flags$/, { perm: 'view' }, hFlags);
+  route('POST', /^\/api\/flags\/(\d+)\/review$/, { perm: 'actions' }, hFlagReview);
+  route('GET', /^\/api\/trolls$/, { perm: 'view' }, hTrolls);
+  route('GET', /^\/api\/layers$/, { perm: 'view' }, hLayers);
+  route('GET', /^\/api\/bans$/, { perm: 'view' }, hBansList);
+  route('POST', /^\/api\/bans$/, { perm: 'actions' }, hBanCreate);
+  route('POST', /^\/api\/bans\/(\d+)\/unban$/, { perm: 'actions' }, hUnban);
+  route('GET', /^\/api\/export\/bans\.cfg$/, { perm: 'actions' }, hExportBans);
+  route('POST', /^\/api\/admin\/warn$/, { perm: 'actions' }, hWarn);
+  route('POST', /^\/api\/admin\/kick$/, { perm: 'actions' }, hKick);
+  route('POST', /^\/api\/admin\/broadcast$/, { perm: 'actions' }, hBroadcast);
+  route('POST', /^\/api\/admin\/forceTeamChange$/, { perm: 'actions' }, hForceTeamChange);
+  route('POST', /^\/api\/admin\/removeFromSquad$/, { perm: 'actions' }, hRemoveFromSquad);
+  route('POST', /^\/api\/admin\/disbandSquad$/, { perm: 'actions' }, hDisbandSquad);
+  route('POST', /^\/api\/admin\/demoteCommander$/, { perm: 'actions' }, hDemoteCommander);
+  route('POST', /^\/api\/admin\/changeLayer$/, { perm: 'actions' }, hChangeLayer);
+  route('POST', /^\/api\/admin\/match$/, { perm: 'actions' }, hMatchOp);
+  route('POST', /^\/api\/admin\/slomo$/, { perm: 'slomo' }, hSlomo);
+  route('POST', /^\/api\/admin\/raw$/, { perm: 'raw' }, hRaw);
+  route('GET', /^\/api\/audit$/, { perm: 'audit' }, hAudit); // §19.3.23: admin+
+  route('GET', /^\/api\/users$/, { perm: 'users' }, hUsersList);
+  route('POST', /^\/api\/users$/, { perm: 'users' }, hUserCreate);
+  route('POST', /^\/api\/users\/(\d+)$/, { perm: 'users' }, hUserUpdate);
+  route('GET', /^\/api\/settings$/, { perm: 'settings' }, hSettings);
+
+  // ------------------------------------------------------------ static files
+  async function serveStatic(req, res, pathname) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return json(res, 405, { error: 'method not allowed' });
+    }
+    // §19.3.26 — decode once (the dispatcher already decoded; `pathname` is
+    // the decoded path), reject \0 and any ".." segment BEFORE resolve.
+    let p = pathname;
+    if (p.includes('\0')) return json(res, 400, { error: 'bad path' });
+    if (p.split('/').includes('..')) return json(res, 400, { error: 'bad path' });
+    if (p === '/') p = '/index.html';
+    const resolved = path.resolve(pubDir, '.' + (p.startsWith('/') ? p : '/' + p));
+    if (!(resolved === pubDir || resolved.startsWith(pubDir + path.sep))) {
+      return json(res, 404, { error: 'not found' });
+    }
+    const ext = path.extname(resolved).toLowerCase();
+    const mime = MIME[ext];
+    if (!mime) return json(res, 404, { error: 'not found' });
+    let buf;
+    try {
+      buf = await fs.promises.readFile(resolved);
+    } catch (_e) {
+      return json(res, 404, { error: 'not found' });
+    }
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Cache-Control', 'no-cache');
+    if (ext === '.html') res.setHeader('Content-Security-Policy', CSP); // §19.3.25
+    res.statusCode = 200;
+    if (req.method === 'HEAD') { res.setHeader('Content-Length', buf.length); res.end(); return; }
+    res.end(buf);
+  }
+
+  // --------------------------------------------------------------- dispatch
+  async function handle(req, res) {
+    res.setHeader('X-Content-Type-Options', 'nosniff'); // §19.3.25 on every response
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    let url;
+    try {
+      url = new URL(req.url, 'http://internal');
+    } catch (_e) {
+      return json(res, 400, { error: 'bad request' });
+    }
+    let pathname;
+    try {
+      pathname = decodeURIComponent(url.pathname); // once; 400 on throw (§19.3.26)
+    } catch (_e) {
+      return json(res, 400, { error: 'bad path encoding' });
+    }
+
+    if (pathname === '/api' || pathname.startsWith('/api/')) {
+      let matched = null;
+      let m = null;
+      let pathExists = false;
+      for (const r of routes) {
+        const mm = r.re.exec(pathname);
+        if (!mm) continue;
+        pathExists = true;
+        if (r.method === req.method) { matched = r; m = mm; break; }
+      }
+      if (!matched) {
+        return json(res, pathExists ? 405 : 404, { error: pathExists ? 'method not allowed' : 'not found' });
+      }
+      const ctx = {
+        req, res, params: m, query: url.searchParams,
+        ip: clientIp(req), user: null, token: null, body: null,
+      };
+      try {
+        if (!matched.opts.public) {
+          // §13: everything except login|setup|bootstrap requires a session.
+          const token = getCookie(req, COOKIE_NAME);
+          const sess = token ? auth.getSession(token) : null;
+          if (!sess) return json(res, 401, { error: 'unauthorized' });
+          ctx.user = sess.user;
+          ctx.token = token;
+          if (sess.refreshed) setSessionCookie(res, req, token); // sliding window (§12)
+          if (!auth.can(ctx.user, matched.opts.perm || 'view')) return json(res, 403, { error: 'forbidden' });
+        }
+        if (req.method === 'POST') {
+          // §19.3.20 — CSRF + Content-Type on every mutating route.
+          const csrfErr = csrfCheck(req);
+          if (csrfErr) return json(res, 403, { error: `request blocked: ${csrfErr}` });
+          if (!isJsonContentType(req)) return json(res, 403, { error: 'Content-Type must be application/json' });
+          const buf = await readBody(req);
+          if (buf.length === 0) {
+            ctx.body = {};
+          } else {
+            let parsed;
+            try {
+              parsed = JSON.parse(buf.toString('utf8'));
+            } catch (_e) {
+              return json(res, 400, { error: 'invalid JSON body' });
+            }
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return json(res, 400, { error: 'JSON object body expected' });
+            }
+            ctx.body = parsed;
+          }
+        }
+        return await matched.handler(ctx);
+      } catch (e) {
+        if (e instanceof ApiErr) return json(res, e.status, { error: e.message });
+        log.error('api', `handler ${req.method} ${pathname} failed: ${scrubText(e && e.message ? e.message : String(e))}`);
+        return json(res, 500, { error: 'internal error' });
+      }
+    }
+    return serveStatic(req, res, pathname);
+  }
+
+  const server = http.createServer((req, res) => {
+    Promise.resolve(handle(req, res)).catch((e) => {
+      log.error('api', `request failed: ${scrubText(e && e.message ? e.message : String(e))}`);
+      if (!res.headersSent) {
+        try { json(res, 500, { error: 'internal error' }); } catch (_e) { /* socket gone */ }
+      } else {
+        try { res.end(); } catch (_e) { /* socket gone */ }
+      }
+    });
+  });
+
+  // Teardown: detach bus listeners, stop timers, drop SSE clients, and make
+  // sure long-lived SSE sockets do not keep server.close() hanging forever.
+  let tornDown = false;
+  function teardown() {
+    if (tornDown) return;
+    tornDown = true;
+    if (bus) for (const [ev, fn] of busWiring) bus.removeListener(ev, fn);
+    clearInterval(sse.pingTimer);
+    if (sse.playersTimer) { clearTimeout(sse.playersTimer); sse.playersTimer = null; }
+    for (const client of [...sse.clients]) dropClient(client);
+  }
+  const origClose = server.close.bind(server);
+  server.close = function close(cb) {
+    teardown();
+    const out = origClose(cb);
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    return out;
+  };
+  server.on('close', teardown);
+
+  return server;
+}
+
+module.exports = { createApi };

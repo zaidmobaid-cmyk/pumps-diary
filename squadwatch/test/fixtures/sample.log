@@ -1,0 +1,28 @@
+[2026.03.01-21.50.52:123][448]LogSquad: PostLogin: NewPlayer: BP_PlayerController_C /Game/Maps/Narva/Gameplay_Layers/Narva_AAS_v2.Narva_AAS_v2:PersistentLevel.BP_PlayerController_C_2147254377 (IP: 86.142.11.23 | Online IDs: EOS: 0002a10386d9114496bce8b6ded68587 steam: 76561198012345678)
+[2026.03.01-21.51.01:004][512]LogNet: Join succeeded: Wardex
+[2026.03.01-21.55.13:901][771]LogSquad: Player:Wardex ActualDamage=38.250000 from BobTheBuilder (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Player Controller ID: BP_PlayerController_C_2147254111)caused by BP_SVDM_Optic_C
+[2026.03.01-21.55.14:120][772]LogSquadTrace: [DedicatedServer]ASQSoldier::Wound(): Player:Wardex KillingDamage=38.250000 from BP_PlayerController_C_2147254111 (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Controller ID: BP_PlayerController_C_2147254111) caused by BP_SVDM_Optic_C
+[2026.03.01-21.56.20:338][801]LogSquadTrace: [DedicatedServer]ASQSoldier::Die(): Player:Wardex KillingDamage=38.250000 from BP_PlayerController_C_2147254111 (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Controller ID: BP_PlayerController_C_2147254111) caused by BP_SVDM_Optic_C
+[2026.03.01-21.57.05:010][850]LogSquad: BobTheBuilder (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321) has revived Wardex (Online IDs: EOS: 0002a10386d9114496bce8b6ded68587 steam: 76561198012345678).
+[2026.03.01-21.58.00:555][900]LogSquadTrace: [DedicatedServer]ASQDeployable::TakeDamage(): BP_FOBRadio_Woodland_C_2146067116: 350.000000 damage attempt by causer BP_C4_Explosive_C_2146001122 instigator GrieferGuy with damage type BP_C4_DamageType_C health remaining 1650.000000
+[2026.03.01-22.01.11:000][100]LogWorld: Bringing World /Game/Maps/Yehorivka/Gameplay_Layers/Yehorivka_RAAS_v1.Yehorivka_RAAS_v1 up for play
+[2026.03.01-22.01.30:000][120]LogGameState: Match State Changed from WaitingToStart to InProgress
+[2026.03.01-22.44.10:222][333]LogSquadGameEvents: Display: Team 2, Manticore Security Task Force ( WPMC ) has won the match with 184 Tickets on layer Yehorivka RAAS v1 (level Yehorivka)!
+[2026.03.01-22.45.00:001][950]LogSquad: USQGameState: Server Tick Rate: 38.45
+[2026.03.01-22.46.00:000][960]LogNet: UNetConnection::Close: [UNetConnection] RemoteAddr: 86.142.11.23:50143, Name: EOSIpNetConnection_2147254300, Driver: GameNetDriver EOSNetDriver_2147482519, IsServer: YES, PC: BP_PlayerController_C_2147254377, Owner: BP_PlayerController_C_2147254377, UniqueId: RedpointEOS:0002a10386d9114496bce8b6ded68587
+[2026.03.01-22.47.00:000][970]LogSquad: GoodGuy (Online IDs: EOS: 0002c0ffee00000000000000000000aa steam: 76561198011112222) has created Squad 3 (Squad Name: ARMOR) on Team Manticore Security Task Force
+[2026.03.01-22.48.00:000][980]LogSquad: ADMIN COMMAND: Message broadcasted <Welcome to the server> from RCON
+[2026.03.01-21.50.50:001][440]LogEOS: Verbose: [LogEOSAntiCheat] [AntiCheatServer] [RegisterClient-001] Client added to session (Client: 0x8231cc47340, UserID: 76561198012345678)
+[2026.03.01-21.50.51:002][444]LogSquadVoiceChannel: Display: Created voice channel: Squad_1_Team_1
+[2026.03.01-21.50.53:200][450]LogNet: NotifyAcceptingConnection accepted from: 86.142.11.23:50143
+[2026.03.01-21.50.53:400][451]LogHandshake: SendConnectChallenge. Timestamp: 3482.21, Cookie: ab12cd34ef56ab78
+[2026.03.01-21.50.54:100][455]LogNet: Server accepting post-challenge connection from: 86.142.11.23:50143
+[2026.03.01-21.51.00:900][510]LogEOSNetworkAuth: Verbose: Network auth handshake begin for EOSIpNetConnection_2147254300
+[2026.03.01-21.52.10:333][600]LogSquadTrace: [DedicatedServer]ASQPlayerController::ChangeState(): PC=Wardex OldState=Playing NewState=Inactive
+[2026.03.01-21.53.00:010][640]LogSquad: Warning: Suitable Spawn Location not found for Wardex, using fallback
+[2026.03.01-21.54.30:777][700]LogOnline: Warning: OSS: Async task 'FOnlineAsyncTaskEOSQueryStats' failed in 0.123 seconds
+[2026.03.01-21.59.59:999][940]LogSquadCommon: SQCommonStatics Check Permissions
+[2026.03.01-22.00.01:123][942]LogGameState: Warning: GetPlayerStateFromUniqueId: No player state found for RedpointEOS:0002a10386d9114496bce8b6ded68587
+[2026.03.01-22.02.02:040][130]LogEOS: Warning: [LogEOSP2P] Ignoring packet from unknown peer: 0002ffffeeee11112222333344445555
+[2026.03.01-22.10.00:500][500]LogSquadVoiceChannel: Display: Destroyed voice channel: Squad_1_Team_1
+[2026.03.01-22.20.20:111][700]LogNet: UNetConnection::Close: [UNetConnection] RemoteAddr: 10.0.0.9:1111, Name: SteamNetConnection_12, Driver: GameNetDriver, IsServer: YES, PC: NULL, Owner: NULL, UniqueId: INVALID
