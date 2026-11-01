@@ -24,6 +24,31 @@
 (function () {
   const SW = (window.SW = window.SW || {});
 
+  /* --------------------------------------------------------------- theme
+   * Light is the default (no attribute). 'dark' sets data-theme="dark" on
+   * <html>. Applied here, at script parse time, so the first render never
+   * flashes the wrong theme. Persisted under the raw key 'sw_theme'.
+   */
+  SW.theme = {
+    current() {
+      return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    },
+    set(t) {
+      if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+      else document.documentElement.removeAttribute('data-theme');
+      try { localStorage.setItem('sw_theme', t === 'dark' ? 'dark' : 'light'); } catch (_e) { /* storage blocked */ }
+      /* canvases re-read their css tokens on every draw; nudge a redraw now */
+      window.dispatchEvent(new Event('resize'));
+    },
+    toggle() { SW.theme.set(SW.theme.current() === 'dark' ? 'light' : 'dark'); },
+  };
+  (function applyStoredTheme() {
+    let t = null;
+    try { t = localStorage.getItem('sw_theme'); } catch (_e) { t = null; }
+    if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+  })();
+
   SW.state = {
     me: null,
     bootstrap: null,
@@ -114,6 +139,8 @@
     refresh: '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     menu: '<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>',
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+    moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
     dot: '<circle cx="12" cy="12" r="4"/>',
   };
 
@@ -522,6 +549,15 @@
   SW.ui.fmtTime = function fmtTime(ts) { return ts ? new Date(Number(ts)).toLocaleString() : '—'; };
   SW.ui.fmtNum = function fmtNum(n) { return (Number(n) || 0).toLocaleString(); };
 
+  /* cssVar('--token') — read a theme token off <html>. Called on every canvas
+   * draw so charts pick up the active theme's palette. */
+  SW.ui.cssVar = function cssVar(name, fallback) {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback || '#888888';
+    } catch (_e) { return fallback || '#888888'; }
+  };
+
   /* sparkline(canvas, numbers, {width, height, color, min, max, fill}) */
   SW.ui.sparkline = function sparkline(canvas, series, opts) {
     opts = opts || {};
@@ -542,7 +578,7 @@
     const max = opts.max != null ? opts.max : Math.max.apply(null, data);
     const span = (max - min) || 1;
     const stepX = w / (data.length - 1);
-    const color = opts.color || '#4ba3f5';
+    const color = opts.color || SW.ui.cssVar('--chart-line', '#2563eb');
     ctx.beginPath();
     for (let i = 0; i < data.length; i++) {
       const x = i * stepX;
@@ -1270,6 +1306,15 @@
       '<span class="tb-chip mono" id="tb-clock" title="match time">--:--</span>' +
       '<span class="tb-dot" id="tb-dot-rcon" title="RCON"><span class="dot" id="dot-rcon"></span></span>' +
       '<span class="tb-dot" id="tb-dot-log" title="Log source"><span class="dot" id="dot-log"></span></span>';
+    const themeBtn = el('button', { type: 'button', class: 'icon-btn theme-btn', id: 'tb-theme' });
+    const syncThemeBtn = () => {
+      const dark = SW.theme.current() === 'dark';
+      themeBtn.innerHTML = SW.icon(dark ? 'sun' : 'moon');
+      themeBtn.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+      themeBtn.title = dark ? 'Light theme' : 'Dark theme';
+    };
+    syncThemeBtn();
+    themeBtn.addEventListener('click', () => { SW.theme.toggle(); syncThemeBtn(); });
     const um = el('button', { type: 'button', class: 'user-btn' });
     um.innerHTML = SW.icon('user') + '<span class="user-name"></span><span class="badge dim role-badge"></span>' + SW.icon('chevron-down');
     um.querySelector('.user-name').textContent = SW.state.me ? SW.state.me.username : '';
@@ -1278,7 +1323,7 @@
       e.stopPropagation();
       SW.ui.popover(um, [{ label: 'Sign out', icon: 'logout', onClick: logout }]);
     });
-    right.append(um);
+    right.append(themeBtn, um);
     tb.append(burger, name, mid, right);
 
     /* mobile drawer backdrop (once) */
@@ -1484,8 +1529,14 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     ctx.font = '10px Inter, system-ui, sans-serif';
+    /* re-read theme tokens on every draw so the chart follows theme switches */
+    const cLabel = SW.ui.cssVar('--chart-label', '#8795aa');
+    const cGrid = SW.ui.cssVar('--chart-grid', '#e8edf4');
+    const cQueue = SW.ui.cssVar('--chart-queue', 'rgba(217,119,6,0.65)');
+    const cLine = SW.ui.cssVar('--chart-line', '#2563eb');
+    const cFill = SW.ui.cssVar('--chart-fill', 'rgba(37,99,235,0.10)');
     if (!samples || samples.length < 2) {
-      ctx.fillStyle = '#5c6a80';
+      ctx.fillStyle = cLabel;
       ctx.fillText('no population samples yet', 12, h / 2);
       return;
     }
@@ -1496,8 +1547,8 @@
     for (const s of samples) maxP = Math.max(maxP, Number(s[1]) || 0, Number(s[2]) || 0);
     const X = (t) => 8 + ((t - t0) / span) * (w - 46);
     const Y = (v) => h - 18 - (v / maxP) * (h - 32);
-    ctx.strokeStyle = 'rgba(35,44,61,0.9)';
-    ctx.fillStyle = '#5c6a80';
+    ctx.strokeStyle = cGrid;
+    ctx.fillStyle = cLabel;
     ctx.lineWidth = 1;
     for (const frac of [0, 0.5, 1]) {
       const v = Math.round(maxP * frac);
@@ -1509,23 +1560,23 @@
     ctx.fillText(fmtT(t0), 8, h - 5);
     const endLab = fmtT(t1);
     ctx.fillText(endLab, w - 38 - ctx.measureText(endLab).width, h - 5);
-    /* queue — faint accent line */
+    /* queue — faint amber line */
     ctx.beginPath();
     samples.forEach((s, i) => { const x = X(s[0]); const y = Y(Number(s[2]) || 0); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
-    ctx.strokeStyle = 'rgba(240,160,32,0.45)';
+    ctx.strokeStyle = cQueue;
     ctx.lineWidth = 1;
     ctx.stroke();
     /* players — main line + fill */
     ctx.beginPath();
     samples.forEach((s, i) => { const x = X(s[0]); const y = Y(Number(s[1]) || 0); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
-    ctx.strokeStyle = '#4ba3f5';
+    ctx.strokeStyle = cLine;
     ctx.lineWidth = 1.8;
     ctx.lineJoin = 'round';
     ctx.stroke();
     ctx.lineTo(X(t1), h - 18);
     ctx.lineTo(X(t0), h - 18);
     ctx.closePath();
-    ctx.fillStyle = 'rgba(75,163,245,0.12)';
+    ctx.fillStyle = cFill;
     ctx.fill();
   }
 
@@ -1660,7 +1711,7 @@
         cLayer.set(snap.currentLayer || si.mapName || '—', 'next: ' + (snap.nextLayer || si.nextLayer || '—'));
         const tick = SW.state.tickRate != null ? SW.state.tickRate : snap.tickRate;
         cMatch.set(undefined, 'tick ' + (tick != null ? Number(tick).toFixed(1) : '—'));
-        if (SW.state.tickHist.length > 1) cMatch.setSpark(SW.state.tickHist, '#30a46c');
+        if (SW.state.tickHist.length > 1) cMatch.setSpark(SW.state.tickHist, SW.ui.cssVar('--green', '#16a34a'));
       }
 
       timers.push(setInterval(() => {
