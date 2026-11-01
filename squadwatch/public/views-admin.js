@@ -824,7 +824,7 @@
   }
 
   function issuerOf(r) {
-    const v = g(r, 'issuerName', 'issuer', 'issuedByName', 'issued_by_name', 'byUsername', 'by_username', 'issuedByUsername');
+    const v = g(r, 'issuerName', 'issuer', 'issuedByName', 'issued_by_name', 'byUsername', 'by_username', 'issuedByUsername', 'username');
     if (v != null && v !== '') return String(v);
     const id = g(r, 'issuedBy', 'issued_by');
     if (id == null) return 'system';
