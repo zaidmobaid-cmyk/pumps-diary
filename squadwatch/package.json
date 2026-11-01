@@ -1,0 +1,14 @@
+{
+  "name": "squadwatch",
+  "version": "1.0.0",
+  "description": "Self-hosted admin & stats panel for Squad dedicated servers — player tracking, teamkill & radio-griefing detection, match history, chat logs, and full RCON admin tools.",
+  "type": "commonjs",
+  "main": "server/index.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server/index.js",
+    "demo": "node server/index.js --demo",
+    "test": "node --test test/"
+  },
+  "license": "MIT"
+}
