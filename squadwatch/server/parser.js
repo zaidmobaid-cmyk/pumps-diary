@@ -34,7 +34,9 @@ function parseLogTime(stamp, tzOffsetMin = 0) {
   const utc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]);
   if (!Number.isFinite(utc)) return null;
   const off = Number(tzOffsetMin);
-  return utc - (Number.isFinite(off) ? off : 0) * 60000;
+  const t = utc - (Number.isFinite(off) ? off : 0) * 60000;
+  // An absurd offset (junk config) must not leak a non-finite epoch into events.
+  return Number.isFinite(t) ? t : null;
 }
 
 function toIntOrNull(s) {
@@ -73,16 +75,16 @@ const LOG_EVENTS = [
     /^LogNet: UNetConnection::Close:.*?UniqueId: RedpointEOS:([0-9a-f]+)/,
     (m) => ({ eosId: m[1] })],
   ['PLAYER_DAMAGED',
-    /^LogSquad: Player:(.+) ActualDamage=([\d.]+) from (.+) \(Online IDs:([^)|]+)\| Player Controller ID: ([^ )]+)\)caused by ([A-Za-z0-9_\-]+)_C/,
+    /^LogSquad: Player:(.+) ActualDamage=(\d[\d.]*) from (.+) \(Online IDs:([^)|]+)\| Player Controller ID: ([^ )]+)\)caused by ([A-Za-z0-9_\-]+)_C/,
     (m) => ({
       victimName: m[1], damage: parseFloat(m[2]), attackerName: m[3],
       attackerIds: m[4], attackerController: m[5], weapon: m[6],
     })],
   ['PLAYER_WOUNDED',
-    /^LogSquadTrace: \[DedicatedServer\](?:ASQSoldier::)?Wound\(\): Player:(.+) KillingDamage=-?([\d.]+) from ([^(]+) \(Online IDs:([^)|]+)\| (?:Player )?Controller ID: ([\w\d]+)\) caused by ([A-Za-z0-9_\-]+)_C/,
+    /^LogSquadTrace: \[DedicatedServer\](?:ASQSoldier::)?Wound\(\): Player:(.+) KillingDamage=-?(\d[\d.]*) from ([^(]+) \(Online IDs:([^)|]+)\| (?:Player )?Controller ID: ([\w\d]+)\) caused by ([A-Za-z0-9_\-]+)_C/,
     woundFields],
   ['PLAYER_DIED',
-    /^LogSquadTrace: \[DedicatedServer\](?:ASQSoldier::)?Die\(\): Player:(.+) KillingDamage=-?([\d.]+) from ([^(]+) \(Online IDs:([^)|]+)\| (?:Player )?Controller ID: ([\w\d]+)\) caused by ([A-Za-z0-9_\-]+)_C/,
+    /^LogSquadTrace: \[DedicatedServer\](?:ASQSoldier::)?Die\(\): Player:(.+) KillingDamage=-?(\d[\d.]*) from ([^(]+) \(Online IDs:([^)|]+)\| (?:Player )?Controller ID: ([\w\d]+)\) caused by ([A-Za-z0-9_\-]+)_C/,
     woundFields],
   ['PLAYER_REVIVED',
     /^LogSquad: (.+) \(Online IDs:([^)]+)\) has revived (.+) \(Online IDs:([^)]+)\)\./,

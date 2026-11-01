@@ -47,16 +47,17 @@ const REDACT_PATHS = [
 const REDACTED = '•••'; // •••
 
 // §19.3.16 — whitelist lookup maps; unknown key -> 400.
-const PLAYER_SORT = {
+// Null-prototype maps so inherited Object.prototype keys can never satisfy a lookup.
+const PLAYER_SORT = Object.assign(Object.create(null), {
   last_seen: 'last_seen', kills: 'kills', teamkills: 'teamkills',
   radio: 'radio_damage_friendly', playtime: 'play_seconds',
-};
-const SORT_DIR = { asc: 'ASC', desc: 'DESC' };
+});
+const SORT_DIR = Object.assign(Object.create(null), { asc: 'ASC', desc: 'DESC' });
 const PLAYER_FILTERS = new Set(['online', 'flagged', 'watchlisted', 'banned']);
 const CHAT_CHANNELS = new Set(['all', 'team', 'squad', 'admin']);
-const FLAGS_REVIEWED = { 0: 'f.reviewed = 0', 1: 'f.reviewed = 1', all: null };
+const FLAGS_REVIEWED = Object.assign(Object.create(null), { 0: 'f.reviewed = 0', 1: 'f.reviewed = 1', all: null });
 const BANS_ACTIVE = new Set(['1', '0', 'all']);
-const MATCH_OPS = { restart: 'restartMatch', end: 'endMatch' };
+const MATCH_OPS = Object.assign(Object.create(null), { restart: 'restartMatch', end: 'endMatch' });
 
 const UNBAN_NOTE = 'Ban deactivated in SquadWatch (join enforcement stops immediately). ' +
   'Squad has no RCON unban command — if this ban was exported, remove the SteamID line from ' +
@@ -99,7 +100,7 @@ function utcDayStart(t) {
  *   -> http.Server (caller listens; server.close() tears down SSE + bus wiring).
  */
 function createApi(deps) {
-  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version } = deps || {};
+  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version, demoCli } = deps || {};
   const cfg = config || {};
   const web = cfg.web || {};
   const trustProxy = web.trustProxy === true; // §19.3.19, default false
@@ -450,8 +451,22 @@ function createApi(deps) {
   ];
   if (bus) for (const [ev, fn] of busWiring) bus.on(ev, fn);
 
+  function dropUserStreams(userId) {
+    for (const client of [...sse.clients]) {
+      if (client.user && client.user.id === userId) dropClient(client);
+    }
+  }
   sse.pingTimer = setInterval(() => {
-    for (const client of [...sse.clients]) sseWrite(client, ': ping\n\n');
+    for (const client of [...sse.clients]) {
+      // Re-check the account on every ping so role changes and disables take
+      // effect on long-lived streams, not just on new requests (§19.3.18).
+      try {
+        const row = db.prepare('SELECT role, disabled FROM users WHERE id = ?').get(client.user.id);
+        if (!row || Number(row.disabled) === 1) { dropClient(client); continue; }
+        client.user.role = row.role;
+      } catch (_e) { /* keep the stream on transient db errors */ }
+      sseWrite(client, ': ping\n\n');
+    }
   }, 25000);
   if (typeof sse.pingTimer.unref === 'function') sse.pingTimer.unref();
 
@@ -495,6 +510,7 @@ function createApi(deps) {
   }
   function hLogout(ctx) {
     if (ctx.token) auth.destroySession(ctx.token);
+    if (ctx.user) dropUserStreams(ctx.user.id);
     setSessionCookie(ctx.res, ctx.req, '', 0);
     return json(ctx.res, 200, { ok: true });
   }
@@ -504,8 +520,9 @@ function createApi(deps) {
       serverName: (state && state.serverInfo && state.serverInfo.serverName) || null,
       version: version == null ? null : version,
     };
-    // §19.3.15: in --demo mode ONLY, bootstrap returns the setup token.
-    if (cfg.demo === true && out.needsSetup && auth.setupToken) out.setupToken = auth.setupToken;
+    // §19.3.15: only the --demo CLI flag (never config.json) exposes the
+    // setup token here; demoCli is passed by index.js and cannot be set from config.
+    if (demoCli === true && out.needsSetup && auth.setupToken) out.setupToken = auth.setupToken;
     return json(ctx.res, 200, out);
   }
   function hSetup(ctx) {
@@ -996,6 +1013,14 @@ function createApi(deps) {
       reason: reason || 'Banned by admin',
     });
     const rconOk = rconRes.ok === true && rconRes.rconOk === true;
+    if (rconRes.ok !== true && rconRes.command == null) {
+      // Validation stopped the command before admin.js could audit it, but the
+      // DB ban below still takes effect (join enforcement) — audit it here.
+      auth.audit(ctx.user.id, 'ban', {
+        targetPlayerId: playerRow.id,
+        details: { interval: intervalStr, reason: reason || null, rconSkipped: rconRes.error || 'no usable selector' },
+      });
+    }
     const nowT = Date.now();
     const expiresAt = durationSec === 0 ? null : nowT + durationSec * 1000;
     const ins = db.prepare(
@@ -1211,6 +1236,7 @@ function createApi(deps) {
     }
     db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
     auth.destroyUserSessions(id); // §19.3.18
+    dropUserStreams(id); // live streams end immediately, not at next request
     auth.audit(ctx.user.id, 'user-update', { details: { userId: id, username: target.username, changed } });
     return json(ctx.res, 200, { ok: true });
   }

@@ -74,6 +74,11 @@ async function main() {
     if (!cfg.web.host) cfg.web.host = '127.0.0.1';
   }
   if (Number.isFinite(args.port)) cfg.web.port = args.port;
+  if (cfg.demo === true && !args.demo) {
+    // "demo": true left in config.json — keep the panel local rather than open.
+    log.warn('boot', 'config.json sets demo:true without the --demo flag; binding to 127.0.0.1. Remove "demo": true for a real deployment.');
+    cfg.web.host = '127.0.0.1';
+  }
 
   const dbPath = path.isAbsolute(cfg.dbPath) ? cfg.dbPath : path.join(ROOT, cfg.dbPath);
   const dataDir = path.dirname(dbPath);
@@ -242,7 +247,9 @@ async function main() {
   timers.push(setInterval(refreshLayers, 6 * 3600 * 1000));
 
   // -------------------------------------------------------------------- api
-  const api = createApi({ db, state, ingest, rcon, bus, auth, admin, config: cfg, parserHealth, version: VERSION });
+  // demoCli is deliberately the CLI flag, never cfg.demo: config.json must not
+  // be able to turn on demo-only conveniences like the bootstrap setup token.
+  const api = createApi({ db, state, ingest, rcon, bus, auth, admin, config: cfg, parserHealth, version: VERSION, demoCli: args.demo });
 
   rcon.connect();
   logsource.start();

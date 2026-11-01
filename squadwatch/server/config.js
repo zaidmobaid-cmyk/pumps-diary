@@ -90,6 +90,11 @@ const SCHEMA = {
   logUnparsed: isBool,
 };
 
+// §19.3.27 — never echo these values, even in validation errors.
+const SECRET_PATHS = new Set([
+  'squad.rconPassword', 'log.ftp.password', 'log.sftp.password', 'steamApiKey', 'discordWebhook',
+]);
+
 function show(v) {
   if (v === undefined) return 'undefined';
   let s;
@@ -107,7 +112,7 @@ function validateNode(value, schema, prefix, problems, unknown) {
     const v = value[key];
     if (typeof spec === 'function') {
       const err = spec(v);
-      if (err) problems.push(`${p} (${err}, got ${show(v)})`);
+      if (err) problems.push(SECRET_PATHS.has(p) ? `${p} (${err})` : `${p} (${err}, got ${show(v)})`);
     } else if (!isPlainObject(v)) {
       problems.push(`${p} (expected object, got ${show(v)})`);
     } else {

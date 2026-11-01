@@ -371,7 +371,7 @@ class Ingest {
       if (rec && name && !rec.name) rec.name = name;
       this.stmt('INSERT INTO chat(time, match_id, player_id, channel, message) VALUES(?,?,?,?,?)')
         .run(time, matchId, p ? p.id : null, pkt.channel || null, message);
-      if (p) {
+      if (p && pkt.channel !== 'admin') { // admin chat never feeds viewer-visible flags (§19.3.23)
         for (const rx of this.watchlist) {
           if (rx.test(message)) {
             this.insertFlag({
