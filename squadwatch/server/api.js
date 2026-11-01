@@ -16,6 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { log, sanitizeRconArg, parseInterval, clampInt } = require('./util');
 const { ACTION_NAMES, STEAM_ID_RE, INTERVAL_RE } = require('./admin');
+const { PERM_INFO } = require('./auth');
 
 const BODY_LIMIT = 64 * 1024; // §13: JSON only, 64KB cap
 const COOKIE_NAME = 'sw_session';
@@ -100,7 +101,7 @@ function utcDayStart(t) {
  *   -> http.Server (caller listens; server.close() tears down SSE + bus wiring).
  */
 function createApi(deps) {
-  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version, demoCli } = deps || {};
+  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version, demoCli, runtime } = deps || {};
   const cfg = config || {};
   const web = cfg.web || {};
   const trustProxy = web.trustProxy === true; // §19.3.19, default false
@@ -111,16 +112,23 @@ function createApi(deps) {
     ...((admin && Array.isArray(admin.actions)) ? admin.actions : ACTION_NAMES),
     'setNextLayer', 'unban', 'note', 'watch', 'manual-flag', 'flag-review',
     'user-create', 'user-update', 'setup',
+    'role-create', 'role-update', 'role-delete',
+    'invite-create', 'invite-revoke', 'invite-use',
+    'settings-update', 'settings-test',
   ]);
 
   // ------------------------------------------------------- secret redaction
-  const secretVals = REDACT_PATHS
-    .map((p) => getPath(cfg, p))
-    .filter((v) => typeof v === 'string' && v.length >= 3);
+  // Read live on every scrub: the settings API can change secrets at runtime,
+  // and a snapshot would leave the new values unscrubbed.
+  function secretVals() {
+    return REDACT_PATHS
+      .map((p) => getPath(cfg, p))
+      .filter((v) => typeof v === 'string' && v.length >= 3);
+  }
 
   function scrubText(s) {
     let out = String(s == null ? '' : s);
-    for (const v of secretVals) if (out.includes(v)) out = out.split(v).join(REDACTED);
+    for (const v of secretVals()) if (out.includes(v)) out = out.split(v).join(REDACTED);
     return out;
   }
   function scrubDeep(x) {
@@ -403,9 +411,10 @@ function createApi(deps) {
     }
   }
   function allowedFor(client, event, data) {
-    if (client.user.role !== 'viewer') return true;
-    if (event === 'chat' && data && data.channel === 'admin') return false;
-    if (data && data.kind === 'ADMIN_CAM') return false;
+    // Admin-channel chat and ADMIN_CAM intel need the adminChat permission
+    // (custom roles make "not a viewer" meaningless as a privilege test).
+    if (event === 'chat' && data && data.channel === 'admin') return auth.can(client.user, 'adminChat');
+    if (data && data.kind === 'ADMIN_CAM') return auth.can(client.user, 'adminChat');
     return true;
   }
   function sseBroadcast(event, data) {
@@ -461,9 +470,14 @@ function createApi(deps) {
       // Re-check the account on every ping so role changes and disables take
       // effect on long-lived streams, not just on new requests (§19.3.18).
       try {
-        const row = db.prepare('SELECT role, disabled FROM users WHERE id = ?').get(client.user.id);
+        const row = db.prepare(
+          `SELECT u.disabled, r.id AS role_id, r.name AS role, r.perms AS perms
+             FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`
+        ).get(client.user.id);
         if (!row || Number(row.disabled) === 1) { dropClient(client); continue; }
         client.user.role = row.role;
+        client.user.roleId = row.role_id;
+        client.user.perms = auth.parsePerms(row.role_id, row.perms);
       } catch (_e) { /* keep the stream on transient db errors */ }
       sseWrite(client, ': ping\n\n');
     }
@@ -1177,10 +1191,14 @@ function createApi(deps) {
   }
 
   function hUsersList(ctx) {
-    const rows = db.prepare('SELECT id, username, role, created_at, last_login, disabled FROM users ORDER BY id').all();
+    const rows = db.prepare(
+      `SELECT u.id, u.username, u.created_at, u.last_login, u.disabled,
+              r.id AS role_id, r.name AS role
+         FROM users u JOIN roles r ON r.id = u.role_id ORDER BY u.id`
+    ).all();
     return json(ctx.res, 200, {
       rows: rows.map((r) => ({
-        id: r.id, username: r.username, role: r.role,
+        id: r.id, username: r.username, role: r.role, roleId: r.role_id,
         createdAt: r.created_at, lastLogin: r.last_login, disabled: !!r.disabled,
       })),
     });
@@ -1189,21 +1207,43 @@ function createApi(deps) {
   function hUserCreate(ctx) {
     const username = strBody(ctx.body.username, 'username', { max: 64 });
     const password = strBody(ctx.body.password, 'password', { max: 1024 });
-    const role = String(ctx.body.role == null ? '' : ctx.body.role);
-    if (!['owner', 'admin', 'viewer'].includes(role)) throw new ApiErr(400, "role must be 'owner', 'admin' or 'viewer'");
+    const roleRef = ctx.body.roleId != null ? Number(ctx.body.roleId) : String(ctx.body.role == null ? '' : ctx.body.role);
+    const role = auth.roleRow(roleRef);
+    if (!role) throw new ApiErr(400, 'unknown role');
+    assertCanGrantRole(ctx.user, role);
     let user;
     try {
-      user = auth.createUser(username, password, role);
+      user = auth.createUser(username, password, role.id);
     } catch (e) {
       throw new ApiErr(400, e.message);
     }
-    auth.audit(ctx.user.id, 'user-create', { details: { username: user.username, role } });
+    auth.audit(ctx.user.id, 'user-create', { details: { username: user.username, role: role.name } });
     return json(ctx.res, 200, { ok: true, user });
+  }
+
+  // The panel must always keep one enabled account whose role can still run it
+  // (users+roles+settings) — the generalized "last owner" rule.
+  function assertNotLastKeyholder(targetId, msg) {
+    if (auth.keyholderCount({ exceptUserId: targetId }) === 0) throw new ApiErr(400, msg);
+  }
+
+  // No privilege amplification: whoever hands out a role (user create/update,
+  // invite) must themselves hold every permission that role grants. Owners
+  // hold everything, so this never constrains them.
+  function assertCanGrantRole(actor, row) {
+    const perms = auth.parsePerms(row.id, row.perms);
+    const missing = Object.keys(perms).filter((k) => perms[k] === true && !auth.can(actor, k));
+    if (missing.length) {
+      throw new ApiErr(403, `you cannot assign a role with permissions you do not hold (${missing.join(', ')})`);
+    }
   }
 
   function hUserUpdate(ctx) {
     const id = intParam(ctx.params[1], 'user id');
-    const target = db.prepare('SELECT id, username, role, disabled FROM users WHERE id = ?').get(id);
+    const target = db.prepare(
+      `SELECT u.id, u.username, u.disabled, u.role_id, r.name AS role, r.perms AS perms
+         FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`
+    ).get(id);
     if (!target) throw new ApiErr(404, 'user not found');
     const body = ctx.body;
     const sets = [];
@@ -1211,10 +1251,11 @@ function createApi(deps) {
     const changed = [];
     let newRole = null;
     let newDisabled = null;
-    if (body.role !== undefined) {
-      newRole = String(body.role);
-      if (!['owner', 'admin', 'viewer'].includes(newRole)) throw new ApiErr(400, 'invalid role');
-      sets.push('role = ?'); params.push(newRole); changed.push('role');
+    if (body.role !== undefined || body.roleId !== undefined) {
+      newRole = auth.roleRow(body.roleId != null ? Number(body.roleId) : String(body.role));
+      if (!newRole) throw new ApiErr(400, 'invalid role');
+      assertCanGrantRole(ctx.user, newRole);
+      sets.push('role_id = ?'); params.push(newRole.id); changed.push(`role:${newRole.name}`);
     }
     if (body.disabled !== undefined) {
       newDisabled = body.disabled === true || body.disabled === 1 ? 1 : 0;
@@ -1225,20 +1266,209 @@ function createApi(deps) {
       sets.push('pass_hash = ?'); params.push(auth.hashPassword(pw)); changed.push('password');
     }
     if (!sets.length) throw new ApiErr(400, 'nothing to update');
-    // Cannot demote (or disable) the last enabled owner (§13).
-    const losesOwner = target.role === 'owner' &&
-      ((newRole != null && newRole !== 'owner') || newDisabled === 1);
-    if (losesOwner) {
-      const others = db.prepare(
-        "SELECT COUNT(*) AS c FROM users WHERE role = 'owner' AND disabled = 0 AND id <> ?"
-      ).get(id);
-      if (!others || Number(others.c) === 0) throw new ApiErr(400, 'cannot demote or disable the last owner');
+    // Would this change cost the target their keyholder status (or the panel
+    // its last keyholder)? Check only when it can (§13 generalized).
+    const targetPerms = auth.parsePerms(target.role_id, target.perms);
+    const wasKeyholder = !target.disabled &&
+      targetPerms.users === true && targetPerms.roles === true && targetPerms.settings === true;
+    if (wasKeyholder) {
+      const nextPerms = newRole ? auth.roleRow(newRole.id) && auth.parsePerms(newRole.id, auth.roleRow(newRole.id).perms) : targetPerms;
+      const staysKeyholder = newDisabled !== 1 &&
+        nextPerms.users === true && nextPerms.roles === true && nextPerms.settings === true;
+      if (!staysKeyholder) {
+        assertNotLastKeyholder(id, 'cannot demote or disable the last account that can manage users, roles and settings');
+      }
     }
     db.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
     auth.destroyUserSessions(id); // §19.3.18
     dropUserStreams(id); // live streams end immediately, not at next request
     auth.audit(ctx.user.id, 'user-update', { details: { userId: id, username: target.username, changed } });
     return json(ctx.res, 200, { ok: true });
+  }
+
+  // ------------------------------------------- roles (docs/ROLES-INVITES-SETTINGS.md §1)
+
+  function hPerms(ctx) {
+    return json(ctx.res, 200, { perms: PERM_INFO });
+  }
+
+  function hRolesList(ctx) {
+    return json(ctx.res, 200, { rows: auth.listRoles() });
+  }
+
+  function hRoleCreate(ctx) {
+    let role;
+    try {
+      role = auth.createRole(ctx.body.name, ctx.body.perms);
+    } catch (e) {
+      throw new ApiErr(400, e.message);
+    }
+    auth.audit(ctx.user.id, 'role-create', { details: { roleId: role.id, name: role.name, perms: Object.keys(role.perms) } });
+    return json(ctx.res, 200, { ok: true, role });
+  }
+
+  function hRoleUpdate(ctx) {
+    const id = intParam(ctx.params[1], 'role id');
+    const current = auth.roleRow(id);
+    if (!current) throw new ApiErr(404, 'role not found');
+    // Pre-check the keyholder invariant: if this edit strips users/roles/
+    // settings from the role, the panel must still have an enabled keyholder
+    // whose role is a DIFFERENT one (owner perms are immutable, so the owner
+    // role itself can never trip this).
+    if (ctx.body.perms !== undefined) {
+      const cur = auth.parsePerms(current.id, current.perms);
+      const wasKeys = cur.users === true && cur.roles === true && cur.settings === true;
+      const p = ctx.body.perms || {};
+      const staysKeys = p.users === true && p.roles === true && p.settings === true;
+      if (wasKeys && !staysKeys) {
+        const rows = db.prepare(
+          `SELECT r.perms, r.id AS role_id FROM users u JOIN roles r ON r.id = u.role_id
+            WHERE u.disabled = 0 AND u.role_id <> ?`
+        ).all(current.id);
+        const otherKeyholder = rows.some((r) => {
+          const q = auth.parsePerms(r.role_id, r.perms);
+          return q.users === true && q.roles === true && q.settings === true;
+        });
+        if (!otherKeyholder) {
+          throw new ApiErr(400, 'this change would leave no account able to manage users, roles and settings');
+        }
+      }
+    }
+    let out;
+    try {
+      out = auth.updateRole(id, { name: ctx.body.name, perms: ctx.body.perms });
+    } catch (e) {
+      throw new ApiErr(/not found/.test(e.message) ? 404 : 400, e.message);
+    }
+    if (out.permsChanged) {
+      // §19.3.18 pattern: a permission change hits members NOW, not at the
+      // next request — sessions die and live streams drop.
+      for (const uid of out.memberIds) {
+        auth.destroyUserSessions(uid);
+        dropUserStreams(uid);
+      }
+    }
+    // Audit exactly which keys moved — the whole point of auditing the most
+    // security-sensitive mutation in the panel (docs/R-I-S §1).
+    const beforePerms = auth.parsePerms(current.id, current.perms);
+    const afterPerms = out.role.perms || {};
+    const permsAdded = Object.keys(afterPerms).filter((k) => !beforePerms[k]);
+    const permsRemoved = Object.keys(beforePerms).filter((k) => !afterPerms[k]);
+    auth.audit(ctx.user.id, 'role-update', {
+      details: {
+        roleId: id, name: out.role.name, permsChanged: out.permsChanged,
+        permsAdded, permsRemoved, members: out.memberIds.length,
+      },
+    });
+    return json(ctx.res, 200, { ok: true, role: out.role });
+  }
+
+  function hRoleDelete(ctx) {
+    const id = intParam(ctx.params[1], 'role id');
+    const row = auth.roleRow(id);
+    if (!row) throw new ApiErr(404, 'role not found');
+    try {
+      auth.deleteRole(id);
+    } catch (e) {
+      throw new ApiErr(/members|invites/.test(e.message) ? 409 : 400, e.message);
+    }
+    auth.audit(ctx.user.id, 'role-delete', { details: { roleId: id, name: row.name } });
+    return json(ctx.res, 200, { ok: true });
+  }
+
+  // ----------------------------------------- invites (docs/ROLES-INVITES-SETTINGS.md §2)
+
+  function inviteUrlFor(ctx, token) {
+    let origin = '';
+    const pub = String((cfg.web && cfg.web.publicUrl) || '').replace(/\/+$/, '');
+    if (pub) origin = pub;
+    else {
+      const host = String(ctx.req.headers.host || '').slice(0, 256);
+      if (host) origin = `${cookieSecure(ctx.req) ? 'https' : 'http'}://${host}`;
+    }
+    return origin ? `${origin}/#/join/${token}` : `/#/join/${token}`;
+  }
+
+  function hInvitesList(ctx) {
+    return json(ctx.res, 200, { rows: auth.listInvites() });
+  }
+
+  function hInviteCreate(ctx) {
+    const roleId = intParam(String(ctx.body.roleId == null ? '' : ctx.body.roleId), 'roleId');
+    const ttlHours = clampInt(ctx.body.ttlHours, 1, 720, 168);
+    const role = auth.roleRow(roleId);
+    if (!role) throw new ApiErr(400, 'unknown role');
+    assertCanGrantRole(ctx.user, role);
+    let inv;
+    try {
+      inv = auth.createInvite({ roleId, ttlMs: ttlHours * 3600 * 1000, createdBy: ctx.user.id });
+    } catch (e) {
+      throw new ApiErr(400, e.message);
+    }
+    auth.audit(ctx.user.id, 'invite-create', { details: { inviteId: inv.id, roleId: inv.roleId, roleName: inv.roleName, ttlHours } });
+    // The token appears in this response exactly once and is never stored.
+    return json(ctx.res, 200, {
+      ok: true,
+      invite: { id: inv.id, roleId: inv.roleId, roleName: inv.roleName, expiresAt: inv.expiresAt },
+      token: inv.token,
+      url: inviteUrlFor(ctx, inv.token),
+    });
+  }
+
+  function hInviteRevoke(ctx) {
+    const id = intParam(ctx.params[1], 'invite id');
+    try {
+      auth.revokeInvite(id);
+    } catch (e) {
+      throw new ApiErr(/not found/.test(e.message) ? 404 : 400, e.message);
+    }
+    auth.audit(ctx.user.id, 'invite-revoke', { details: { inviteId: id } });
+    return json(ctx.res, 200, { ok: true });
+  }
+
+  // Public probe for the join page. Rate-limited; one generic answer for every
+  // non-claimable state (no oracle).
+  function hJoinPeek(ctx) {
+    const lim = auth.loginLimiter.attempt(ctx.ip);
+    if (!lim.ok) {
+      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
+      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
+    }
+    const inv = auth.findInvite(String(ctx.query.get('token') || ''));
+    if (!inv) return json(ctx.res, 200, { valid: false });
+    return json(ctx.res, 200, {
+      valid: true,
+      roleName: inv.roleName,
+      serverName: (state && state.serverInfo && state.serverInfo.serverName) || null,
+    });
+  }
+
+  function hJoin(ctx) {
+    const lim = auth.loginLimiter.attempt(ctx.ip);
+    if (!lim.ok) {
+      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
+      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
+    }
+    const token = strBody(ctx.body.token, 'token', { max: 256 });
+    const username = strBody(ctx.body.username, 'username', { max: 64 });
+    const password = strBody(ctx.body.password, 'password', { max: 1024 });
+    let claimed;
+    try {
+      claimed = auth.claimInvite(token, { username, password });
+    } catch (e) {
+      return json(ctx.res, 400, { error: e.message });
+    }
+    auth.loginLimiter.reset(ctx.ip);
+    auth.audit(null, 'invite-use', {
+      details: { inviteId: claimed.inviteId, userId: claimed.user.id, username: claimed.user.username, role: claimed.user.role },
+    });
+    // Straight into the panel: same session flow as /api/login.
+    const sess = auth.createSession(claimed.user.id, {
+      ip: ctx.ip, ua: String(ctx.req.headers['user-agent'] || '').slice(0, 256),
+    });
+    setSessionCookie(ctx.res, ctx.req, sess.token);
+    const full = auth.getSession(sess.token);
+    return json(ctx.res, 200, { ok: true, user: full ? full.user : claimed.user });
   }
 
   function hSettings(ctx) {
@@ -1253,6 +1483,17 @@ function createApi(deps) {
     try { unmatched24h = Number(ph.count24h()) || 0; } catch (_e) { unmatched24h = 0; }
     return json(ctx.res, 200, {
       config: redactedConfig(), // §19.3.27
+      // Which secrets EXIST (never their values) — the Settings form shows
+      // "saved" placeholders from this.
+      secretsSet: {
+        rconPassword: !!(cfg.squad && cfg.squad.rconPassword),
+        ftpPassword: !!(cfg.log && cfg.log.ftp && cfg.log.ftp.password),
+        sftpPassword: !!(cfg.log && cfg.log.sftp && cfg.log.sftp.password),
+        steamApiKey: !!cfg.steamApiKey,
+        discordWebhook: !!cfg.discordWebhook,
+      },
+      demo: demoCli === true,
+      linked: !!(cfg.squad && cfg.squad.rconHost),
       status: {
         rcon: rconStatus(),
         log: logStatusOut(),
@@ -1262,6 +1503,51 @@ function createApi(deps) {
         gameVersion: (state && state.serverInfo && state.serverInfo.gameVersion) || null, // §19.1.10
       },
     });
+  }
+
+  // POST /api/settings — validate, persist to config.json, apply live
+  // (docs/ROLES-INVITES-SETTINGS.md §3). Demo settings are fixed.
+  function hSettingsUpdate(ctx) {
+    if (demoCli === true) throw new ApiErr(403, 'demo settings are fixed — run without --demo to configure a real server');
+    if (!runtime || typeof runtime.applySettings !== 'function') throw new ApiErr(500, 'settings runtime unavailable');
+    let out;
+    try {
+      out = runtime.applySettings(ctx.body || {});
+    } catch (e) {
+      // Validation messages already redact secret values (config.js §19.3.27).
+      throw new ApiErr(400, scrubText(e.message));
+    }
+    auth.audit(ctx.user.id, 'settings-update', {
+      details: { changed: out.changedPaths, persistError: out.persistError || null },
+    });
+    return json(ctx.res, 200, { ok: true, changed: out.changedPaths, persistError: out.persistError || null });
+  }
+
+  // POST /api/settings/test — one-shot probes with candidate values, never
+  // touching the live clients. RCON: {rconHost, rconPort, rconPassword?} (null
+  // password = saved). Log source: {log:{mode?, path?, ftp?, sftp?}} — local
+  // stats the file; ftp/sftp checks the optional package, then connects.
+  async function hSettingsTest(ctx) {
+    if (demoCli === true) throw new ApiErr(403, 'demo settings are fixed');
+    if (!runtime) throw new ApiErr(500, 'settings runtime unavailable');
+    if (ctx.body.log !== undefined) {
+      if (typeof runtime.testLog !== 'function') throw new ApiErr(500, 'settings runtime unavailable');
+      const out = await runtime.testLog(ctx.body.log || {});
+      auth.audit(ctx.user.id, 'settings-test', {
+        details: { target: 'log', mode: (ctx.body.log && ctx.body.log.mode) || null, ok: !!out.ok },
+      });
+      if (out.error) out.error = scrubText(String(out.error));
+      return json(ctx.res, 200, out);
+    }
+    if (typeof runtime.testRcon !== 'function') throw new ApiErr(500, 'settings runtime unavailable');
+    const host = strBody(ctx.body.rconHost, 'rconHost', { max: 256 });
+    const port = clampInt(ctx.body.rconPort, 1, 65535, 0);
+    if (!port) throw new ApiErr(400, 'rconPort must be 1-65535');
+    const password = ctx.body.rconPassword == null ? null : String(ctx.body.rconPassword).slice(0, 1024);
+    const out = await runtime.testRcon({ host, port, password });
+    auth.audit(ctx.user.id, 'settings-test', { details: { target: 'rcon', host, port, ok: !!out.ok } });
+    if (out.error) out.error = scrubText(String(out.error));
+    return json(ctx.res, 200, out);
   }
 
   // -------------------------------------------------------------- the router
@@ -1274,41 +1560,53 @@ function createApi(deps) {
   route('POST', /^\/api\/setup$/, { public: true }, hSetup);
   route('GET', /^\/api\/me$/, { perm: 'view' }, hMe);
   route('GET', /^\/api\/overview$/, { perm: 'view' }, hOverview);
-  route('GET', /^\/api\/stream$/, { perm: 'view' }, hStream);
+  route('GET', /^\/api\/stream$/, { perm: 'stream' }, hStream);
   route('GET', /^\/api\/pop$/, { perm: 'view' }, hPop);
   route('GET', /^\/api\/players$/, { perm: 'view' }, hPlayers);
   route('GET', /^\/api\/players\/(\d+)$/, { perm: 'view' }, hPlayer);
   route('GET', /^\/api\/players\/(\d+)\/chat$/, { perm: 'view' }, hPlayerChat);
-  route('POST', /^\/api\/players\/(\d+)\/notes$/, { perm: 'actions' }, hNoteAdd);
-  route('POST', /^\/api\/players\/(\d+)\/watch$/, { perm: 'actions' }, hWatch);
-  route('POST', /^\/api\/players\/(\d+)\/flag$/, { perm: 'actions' }, hManualFlag);
+  route('POST', /^\/api\/players\/(\d+)\/notes$/, { perm: 'notes' }, hNoteAdd);
+  route('POST', /^\/api\/players\/(\d+)\/watch$/, { perm: 'flags' }, hWatch);
+  route('POST', /^\/api\/players\/(\d+)\/flag$/, { perm: 'flags' }, hManualFlag);
   route('GET', /^\/api\/matches$/, { perm: 'view' }, hMatches);
   route('GET', /^\/api\/matches\/(\d+)$/, { perm: 'view' }, hMatch);
   route('GET', /^\/api\/chat$/, { perm: 'view' }, hChat);
   route('GET', /^\/api\/flags$/, { perm: 'view' }, hFlags);
-  route('POST', /^\/api\/flags\/(\d+)\/review$/, { perm: 'actions' }, hFlagReview);
+  route('POST', /^\/api\/flags\/(\d+)\/review$/, { perm: 'flags' }, hFlagReview);
   route('GET', /^\/api\/trolls$/, { perm: 'view' }, hTrolls);
   route('GET', /^\/api\/layers$/, { perm: 'view' }, hLayers);
   route('GET', /^\/api\/bans$/, { perm: 'view' }, hBansList);
-  route('POST', /^\/api\/bans$/, { perm: 'actions' }, hBanCreate);
-  route('POST', /^\/api\/bans\/(\d+)\/unban$/, { perm: 'actions' }, hUnban);
-  route('GET', /^\/api\/export\/bans\.cfg$/, { perm: 'actions' }, hExportBans);
-  route('POST', /^\/api\/admin\/warn$/, { perm: 'actions' }, hWarn);
-  route('POST', /^\/api\/admin\/kick$/, { perm: 'actions' }, hKick);
-  route('POST', /^\/api\/admin\/broadcast$/, { perm: 'actions' }, hBroadcast);
-  route('POST', /^\/api\/admin\/forceTeamChange$/, { perm: 'actions' }, hForceTeamChange);
-  route('POST', /^\/api\/admin\/removeFromSquad$/, { perm: 'actions' }, hRemoveFromSquad);
-  route('POST', /^\/api\/admin\/disbandSquad$/, { perm: 'actions' }, hDisbandSquad);
-  route('POST', /^\/api\/admin\/demoteCommander$/, { perm: 'actions' }, hDemoteCommander);
-  route('POST', /^\/api\/admin\/changeLayer$/, { perm: 'actions' }, hChangeLayer);
-  route('POST', /^\/api\/admin\/match$/, { perm: 'actions' }, hMatchOp);
+  route('POST', /^\/api\/bans$/, { perm: 'ban' }, hBanCreate);
+  route('POST', /^\/api\/bans\/(\d+)\/unban$/, { perm: 'ban' }, hUnban);
+  route('GET', /^\/api\/export\/bans\.cfg$/, { perm: 'ban' }, hExportBans);
+  route('POST', /^\/api\/admin\/warn$/, { perm: 'warn' }, hWarn);
+  route('POST', /^\/api\/admin\/kick$/, { perm: 'kick' }, hKick);
+  route('POST', /^\/api\/admin\/broadcast$/, { perm: 'broadcast' }, hBroadcast);
+  route('POST', /^\/api\/admin\/forceTeamChange$/, { perm: 'team' }, hForceTeamChange);
+  route('POST', /^\/api\/admin\/removeFromSquad$/, { perm: 'squad' }, hRemoveFromSquad);
+  route('POST', /^\/api\/admin\/disbandSquad$/, { perm: 'squad' }, hDisbandSquad);
+  route('POST', /^\/api\/admin\/demoteCommander$/, { perm: 'squad' }, hDemoteCommander);
+  route('POST', /^\/api\/admin\/changeLayer$/, { perm: 'layer' }, hChangeLayer);
+  route('POST', /^\/api\/admin\/match$/, { perm: 'match' }, hMatchOp);
   route('POST', /^\/api\/admin\/slomo$/, { perm: 'slomo' }, hSlomo);
   route('POST', /^\/api\/admin\/raw$/, { perm: 'raw' }, hRaw);
   route('GET', /^\/api\/audit$/, { perm: 'audit' }, hAudit); // §19.3.23: admin+
   route('GET', /^\/api\/users$/, { perm: 'users' }, hUsersList);
   route('POST', /^\/api\/users$/, { perm: 'users' }, hUserCreate);
   route('POST', /^\/api\/users\/(\d+)$/, { perm: 'users' }, hUserUpdate);
+  route('GET', /^\/api\/perms$/, { anyPerm: ['users', 'roles'] }, hPerms);
+  route('GET', /^\/api\/roles$/, { anyPerm: ['users', 'roles'] }, hRolesList);
+  route('POST', /^\/api\/roles$/, { perm: 'roles' }, hRoleCreate);
+  route('POST', /^\/api\/roles\/(\d+)$/, { perm: 'roles' }, hRoleUpdate);
+  route('POST', /^\/api\/roles\/(\d+)\/delete$/, { perm: 'roles' }, hRoleDelete);
+  route('GET', /^\/api\/invites$/, { perm: 'users' }, hInvitesList);
+  route('POST', /^\/api\/invites$/, { perm: 'users' }, hInviteCreate);
+  route('POST', /^\/api\/invites\/(\d+)\/revoke$/, { perm: 'users' }, hInviteRevoke);
+  route('GET', /^\/api\/join$/, { public: true }, hJoinPeek);
+  route('POST', /^\/api\/join$/, { public: true }, hJoin);
   route('GET', /^\/api\/settings$/, { perm: 'settings' }, hSettings);
+  route('POST', /^\/api\/settings$/, { perm: 'settings' }, hSettingsUpdate);
+  route('POST', /^\/api\/settings\/test$/, { perm: 'settings' }, hSettingsTest);
 
   // ------------------------------------------------------------ static files
   async function serveStatic(req, res, pathname) {
@@ -1385,7 +1683,10 @@ function createApi(deps) {
           ctx.user = sess.user;
           ctx.token = token;
           if (sess.refreshed) setSessionCookie(res, req, token); // sliding window (§12)
-          if (!auth.can(ctx.user, matched.opts.perm || 'view')) return json(res, 403, { error: 'forbidden' });
+          const allowed = matched.opts.anyPerm
+            ? matched.opts.anyPerm.some((p) => auth.can(ctx.user, p))
+            : auth.can(ctx.user, matched.opts.perm || 'view');
+          if (!allowed) return json(res, 403, { error: 'forbidden' });
         }
         if (req.method === 'POST') {
           // §19.3.20 — CSRF + Content-Type on every mutating route.

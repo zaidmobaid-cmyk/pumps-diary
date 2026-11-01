@@ -393,4 +393,17 @@ function createLogSource(cfg, opts) {
   return new LogSource(cfg, opts);
 }
 
-module.exports = { createLogSource };
+// Can this mode's optional dependency be loaded right now? Lets the settings
+// API refuse an ftp/sftp save BEFORE anything is applied or persisted, instead
+// of throwing from start() after the config already changed.
+function modeAvailable(mode) {
+  try {
+    if (mode === 'ftp') lazyRequire('basic-ftp');
+    else if (mode === 'sftp') lazyRequire('ssh2-sftp-client');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+module.exports = { createLogSource, modeAvailable };

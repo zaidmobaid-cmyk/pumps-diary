@@ -342,7 +342,7 @@
     row.append(SW.ui.timeAgo(g(f, 'time')));
     if (reviewed) {
       row.append(SW.ui.badge('reviewed', 'ok'));
-    } else if (SW.can('admin')) {
+    } else if (SW.can('flags')) {
       const btn = el('button', { type: 'button', class: 'btn ghost small', text: 'Review' });
       btn.addEventListener('click', async () => {
         const v = await SW.ui.confirmModal({
@@ -603,9 +603,9 @@
     }
     namesCol.append(meta);
 
-    /* actions (admin+) */
+    /* actions — each button behind its own granular perm (§1) */
     const actions = el('div', { class: 'profile-actions' });
-    if (SW.can('admin')) {
+    if (SW.can('flags')) {
       const watchBtn = el('button', { type: 'button', class: 'btn ghost small' });
       const syncWatch = () => {
         watchBtn.innerHTML = SW.icon('star') + '<span>' + (ref.watchlisted ? 'Watching' : 'Watch') + '</span>';
@@ -617,22 +617,22 @@
         await SW.actions.watch(ref, !ref.watchlisted);
         syncWatch();
       });
+      actions.append(watchBtn);
+    }
+    {
       const mk = (label, icon, fn, danger) => {
         const b = el('button', { type: 'button', class: 'btn small' + (danger ? ' danger ghost' : '') });
         b.innerHTML = SW.icon(icon) + '<span>' + SW.esc(label) + '</span>';
         b.addEventListener('click', fn);
         return b;
       };
-      actions.append(
-        watchBtn,
-        mk('Warn', 'warn', () => SW.actions.warn(ref)),
-        mk('Kick', 'kick', () => SW.actions.kick(ref)),
-        mk('Ban', 'ban', () => SW.actions.ban(ref), true),
-        mk('Force team', 'swap', () => SW.actions.forceTeam(ref)),
-        mk('Unsquad', 'x', () => SW.actions.removeFromSquad(ref)),
-        mk('Note', 'note', () => SW.actions.note(ref)),
-        mk('Flag', 'flag', manualFlag)
-      );
+      if (SW.can('warn')) actions.append(mk('Warn', 'warn', () => SW.actions.warn(ref)));
+      if (SW.can('kick')) actions.append(mk('Kick', 'kick', () => SW.actions.kick(ref)));
+      if (SW.can('ban')) actions.append(mk('Ban', 'ban', () => SW.actions.ban(ref), true));
+      if (SW.can('team')) actions.append(mk('Force team', 'swap', () => SW.actions.forceTeam(ref)));
+      if (SW.can('squad')) actions.append(mk('Unsquad', 'x', () => SW.actions.removeFromSquad(ref)));
+      if (SW.can('notes')) actions.append(mk('Note', 'note', () => SW.actions.note(ref)));
+      if (SW.can('flags')) actions.append(mk('Flag', 'flag', manualFlag));
     }
     async function manualFlag() {
       try {
@@ -928,7 +928,7 @@
         r.append(body);
         return r;
       }
-      if (SW.can('admin')) {
+      if (SW.can('notes')) {
         const ta = el('textarea', { class: 'input', rows: '3', placeholder: 'Add a note visible to admins…', 'aria-label': 'New note' });
         const save = el('button', { type: 'button', class: 'btn primary small', text: 'Save note' });
         save.addEventListener('click', async () => {
@@ -965,7 +965,7 @@
         badgeKind: 'warn', render: renderIncidents,
       },
       { id: 'chat', label: 'Chat', badge: chatCount || null, render: renderChatTab },
-      { id: 'sessions', label: 'Sessions & IPs', hidden: !SW.can('admin'), render: renderSessions },
+      { id: 'sessions', label: 'Sessions & IPs', hidden: !SW.can('ips'), render: renderSessions },
       {
         id: 'discipline', label: 'Discipline',
         badge: (warningsList.length + bansList.length + flagsList.length) || null,
@@ -1253,7 +1253,7 @@
       { value: 'team', label: 'Team' },
       { value: 'squad', label: 'Squad' },
     ];
-    if (SW.can('admin')) chanItems.push({ value: 'admin', label: 'Admin' });
+    if (SW.can('adminChat')) chanItems.push({ value: 'admin', label: 'Admin' });
     const chanChips = chipBar(chanItems, channel, (v) => { channel = v; page = 0; load(); });
 
     const sInput = el('input', {

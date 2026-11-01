@@ -99,6 +99,40 @@ CREATE TABLE pop_samples(time INTEGER PRIMARY KEY, players INTEGER, queue INTEGE
 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);
 `;
 
+// v2 — custom roles + invite links (docs/ROLES-INVITES-SETTINGS.md).
+// users is rebuilt from role TEXT to role_id FK; builtin role rows are seeded
+// from auth.js's matrix so legacy 'owner'/'admin'/'viewer' behavior is identical.
+const DDL_V2 = `
+CREATE TABLE roles(
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE COLLATE NOCASE,
+  builtin INTEGER DEFAULT 0,
+  perms TEXT,
+  created_at INTEGER);
+CREATE TABLE invites(
+  id INTEGER PRIMARY KEY,
+  token_hash TEXT UNIQUE,
+  role_id INTEGER REFERENCES roles(id),
+  created_by INTEGER,
+  created_at INTEGER,
+  expires_at INTEGER,
+  used_by INTEGER,
+  used_at INTEGER,
+  revoked_at INTEGER);
+`;
+
+const USERS_V2_REBUILD = `
+CREATE TABLE users_v2(
+  id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
+  pass_hash TEXT, role_id INTEGER NOT NULL REFERENCES roles(id),
+  created_at INTEGER, last_login INTEGER, disabled INTEGER DEFAULT 0);
+INSERT INTO users_v2(id, username, pass_hash, role_id, created_at, last_login, disabled)
+  SELECT u.id, u.username, u.pass_hash, r.id, u.created_at, u.last_login, u.disabled
+    FROM users u JOIN roles r ON r.name = u.role;
+DROP TABLE users;
+ALTER TABLE users_v2 RENAME TO users;
+`;
+
 // Normalize bound parameters so both backends behave identically:
 // undefined -> NULL, booleans -> 1/0. (better-sqlite3 rejects both outright;
 // keeping this in one place means callers never have to care.)
@@ -178,6 +212,31 @@ function openDb(dbPath) {
       });
       version = 1;
       log.info('db', `migrated schema to v1 (${backend.kind})`);
+    }
+    if (version < 2) {
+      // Late require: auth.js owns the permission matrix; no import cycle
+      // (auth.js never requires db.js).
+      const { builtinRolePerms } = require('./auth');
+      const t = Date.now();
+      tx(() => {
+        exec(DDL_V2);
+        const ins = prepare('INSERT INTO roles(name, builtin, perms, created_at) VALUES(?,1,?,?)');
+        for (const name of ['owner', 'admin', 'viewer']) {
+          ins.run(name, JSON.stringify(builtinRolePerms(name)), t);
+        }
+        const before = prepare('SELECT COUNT(*) AS c FROM users').get();
+        exec(USERS_V2_REBUILD);
+        const after = prepare('SELECT COUNT(*) AS c FROM users').get();
+        // The rebuild joins users.role to the seeded role names; a row with an
+        // unexpected role value would silently vanish. Refuse to migrate a db
+        // we would lose accounts from (tx rolls back, old schema intact).
+        if (Number(before.c) !== Number(after.c)) {
+          throw new Error(`v2 migration would drop ${Number(before.c) - Number(after.c)} user(s) with unrecognized roles — aborting`);
+        }
+        prepare('UPDATE schema_version SET version=?').run(2);
+      });
+      version = 2;
+      log.info('db', 'migrated schema to v2 (roles, invites)');
     }
     return version;
   }

@@ -1,15 +1,17 @@
 'use strict';
 /* SquadWatch — views-admin.js (stage 3: admin surfaces)
  *
- * Registers SW.routes.admin / console / bans / audit / users / settings per
- * spec §14.3 + §19 amendments (login + setup live in app.js).
+ * Registers SW.routes.admin / console / bans / audit / users / roles /
+ * settings per spec §14.3 + §19 amendments and
+ * docs/ROLES-INVITES-SETTINGS.md (login + setup + join live in app.js).
  *
  * Conventions (established by app.js / views.js):
- *   - SW.routes[name] = { role?, render(el, ctx), cleanup() }; render runs with
- *     this = route def and reassigns this.cleanup; SW.live.on() unsubscribers,
- *     timers and document-level listeners are cleared there.
- *   - Role gates mirror the app.js NAV table: admin + bans + audit are admin+,
- *     console / users / settings are owner-only (§19.3.23: audit is admin+).
+ *   - SW.routes[name] = { perm?, render(el, ctx), cleanup() }; render runs
+ *     with this = route def and reassigns this.cleanup; SW.live.on()
+ *     unsubscribers, timers and document-level listeners are cleared there.
+ *   - Perm gates mirror the app.js NAV table: granular keys per §1 — a perm
+ *     array means "any one grants" (SW.canAny). In-view buttons are gated by
+ *     their own key (kick needs kick, ban needs ban, …).
  *   - CSP: script-src 'self' — NO inline handlers; everything is wired with
  *     addEventListener / SW.ui.el on<event> keys.
  *   - §19.3.25 XSS sinks: console output, audit rcon_command / rcon_response,
@@ -207,6 +209,13 @@
     const grid = el('div', { class: 'admin-grid' });
     view.append(grid);
 
+    /* per-card perm gates (§1): a card only renders (and only syncs) when the
+     * viewer holds its key; quick-action buttons are filtered one by one. */
+    const canBroadcast = SW.can('broadcast');
+    const canLayer = SW.can('layer');
+    const canMatch = SW.can('match');
+    const canSquad = SW.can('squad');
+
     /* ---------------------------------------------- broadcast composer */
     const bcCard = el('div', { class: 'card' });
     bcCard.append(cardTitle('broadcast', 'Broadcast'));
@@ -223,7 +232,7 @@
       class: 'hint',
       text: 'Presets are saved in this browser only.',
     }));
-    grid.append(bcCard);
+    if (canBroadcast) grid.append(bcCard);
 
     function getPresets() {
       const p = SW.prefs.get(BC_PRESET_KEY, []);
@@ -303,7 +312,7 @@
     const lRefresh = iconBtn('Refresh list', 'refresh', 'ghost small');
     lFoot.append(lCount, lRefresh);
     layerCard.append(lSearch, lList, lFoot);
-    grid.append(layerCard);
+    if (canLayer) grid.append(layerCard);
 
     let layers = [];
     let layersLoading = false;
@@ -389,7 +398,7 @@
     const bEnd = iconBtn('End match', 'flag', 'danger');
     matchCard.append(mInfo, el('div', { class: 'row-wrap' }, bRestart, bEnd),
       el('div', { class: 'hint', text: 'Both actions ask twice — they hit every player on the server.' }));
-    grid.append(matchCard);
+    if (canMatch) grid.append(matchCard);
 
     function syncMatchInfo() {
       mInfo.textContent = '';
@@ -445,7 +454,7 @@
       el('div', { class: 'field' }, el('label', { text: 'Demote commander' }), cmdPicker.el),
       el('div', { class: 'row', style: 'justify-content:flex-end' }, bDemote)
     );
-    grid.append(sqCard);
+    if (canSquad) grid.append(sqCard);
 
     function teamsOf() { return (SW.state.snapshot && SW.state.snapshot.teams) || []; }
     function rebuildTeamSel() {
@@ -532,43 +541,42 @@
       });
       return b;
     }
-    qaRow.append(
-      qa('Warn', 'warn', (r) => SW.actions.warn(r)),
-      qa('Kick', 'kick', (r) => SW.actions.kick(r)),
-      qa('Ban', 'ban', (r) => SW.actions.ban(r), true),
-      qa('Force team', 'swap', (r) => SW.actions.forceTeam(r)),
-      qa('Unsquad', 'x', (r) => SW.actions.removeFromSquad(r))
-    );
+    const qaButtons = [];
+    if (SW.can('warn')) qaButtons.push(qa('Warn', 'warn', (r) => SW.actions.warn(r)));
+    if (SW.can('kick')) qaButtons.push(qa('Kick', 'kick', (r) => SW.actions.kick(r)));
+    if (SW.can('ban')) qaButtons.push(qa('Ban', 'ban', (r) => SW.actions.ban(r), true));
+    if (SW.can('team')) qaButtons.push(qa('Force team', 'swap', (r) => SW.actions.forceTeam(r)));
+    if (canSquad) qaButtons.push(qa('Unsquad', 'x', (r) => SW.actions.removeFromSquad(r)));
+    qaRow.append(...qaButtons);
     qaCard.append(qaRow, el('div', {
       class: 'hint',
       text: 'Offline players: open their profile from the Players page for the same actions.',
     }));
-    grid.append(qaCard);
+    if (qaButtons.length) grid.append(qaCard);
+
+    if (!grid.children.length) {
+      view.append(SW.ui.empty('Your role has no admin tools — broadcast, layer, match or squad permissions unlock them', 'lock'));
+      return;
+    }
 
     /* ------------------------------------------------ live wiring */
-    const syncLive = debounce(() => {
-      syncLayerKv();
-      syncMatchInfo();
-      drawLayers();
-      rebuildTeamSel();
-      cmdPicker.rebuild();
-      qaPicker.rebuild();
-    }, 400);
+    const syncAll = () => {
+      if (canLayer) { syncLayerKv(); drawLayers(); }
+      if (canMatch) syncMatchInfo();
+      if (canSquad) { rebuildTeamSel(); cmdPicker.rebuild(); }
+      if (qaButtons.length) qaPicker.rebuild();
+    };
+    const syncLive = debounce(syncAll, 400);
     unsubs.push(SW.live.on('players', syncLive));
     unsubs.push(SW.live.on('serverinfo', syncLive));
     unsubs.push(SW.live.on('match', syncLive));
     unsubs.push(SW.live.on('connect', syncLive));
     unsubs.push(SW.live.on('disconnect', syncLive));
 
-    syncLayerKv();
-    syncMatchInfo();
-    rebuildTeamSel();
-    loadLayers(false);
-    if (!SW.state.snapshot) {
-      SW.refreshOverview().then(() => {
-        syncLayerKv(); syncMatchInfo(); rebuildTeamSel(); cmdPicker.rebuild(); qaPicker.rebuild(); drawLayers();
-      });
-    }
+    if (canLayer) { syncLayerKv(); loadLayers(false); }
+    if (canMatch) syncMatchInfo();
+    if (canSquad) rebuildTeamSel();
+    if (!SW.state.snapshot) SW.refreshOverview().then(syncAll);
   }
 
   /* ========================================================== CONSOLE view */
@@ -1190,7 +1198,12 @@
 
   /* ============================================================ USERS view */
 
-  const ROLES = ['viewer', 'admin', 'owner'];
+  /* a role that can still run the panel (users+roles+settings) — handing it
+   * out gets the danger treatment the old "→ owner" confirm had */
+  function isKeyholderRole(role) {
+    const p = (role && role.perms) || {};
+    return p.users === true && p.roles === true && p.settings === true;
+  }
 
   function renderUsers(main) {
     this.cleanup = () => {};
@@ -1200,33 +1213,44 @@
     view.append(listBox);
 
     const meId = SW.state.me && SW.state.me.id;
+    let roles = []; /* GET /api/roles rows — feed every role <select> (§1) */
 
-    function roleCell(r) {
-      const sel = el('select', { class: 'input', 'aria-label': 'Role for ' + (r.username || 'user'), style: 'min-width:100px;padding:4px 8px' });
-      for (const role of ROLES) {
-        const o = el('option', { value: role, text: role });
-        if (String(r.role) === role) o.selected = true;
+    function roleOptions(sel, selectedId) {
+      sel.textContent = '';
+      for (const role of roles) {
+        const o = el('option', { value: String(role.id), text: role.name });
+        if (selectedId != null && Number(selectedId) === Number(role.id)) o.selected = true;
         sel.append(o);
       }
+    }
+
+    function roleCell(r) {
+      let curId = g(r, 'roleId', 'role_id');
+      if (!roles.length) return el('span', { class: 'nowrap', text: String(r.role || '?') });
+      const sel = el('select', { class: 'input', 'aria-label': 'Role for ' + (r.username || 'user'), style: 'min-width:100px;padding:4px 8px' });
+      roleOptions(sel, curId);
       if (r.id === meId) {
         sel.disabled = true;
         sel.title = 'You cannot change your own role';
         return sel;
       }
       sel.addEventListener('change', async () => {
-        const newRole = sel.value;
+        const newRole = roles.find((x) => String(x.id) === sel.value);
+        if (!newRole) { sel.value = String(curId); return; }
         const v = await SW.ui.confirmModal({
           title: 'Change role',
-          body: 'Change ' + (r.username || 'this user') + ' from ' + r.role + ' to ' + newRole + '? Their sessions are signed out.',
+          body: 'Change ' + (r.username || 'this user') + ' from ' + r.role + ' to ' + newRole.name + '? Their sessions are signed out.',
           confirmText: 'Change role',
-          danger: newRole === 'owner',
+          danger: isKeyholderRole(newRole),
         });
-        if (!v) { sel.value = String(r.role); return; }
+        if (!v) { sel.value = String(curId); return; }
         try {
-          await SW.api('/api/users/' + encodeURIComponent(r.id), { method: 'POST', body: { role: newRole } });
-          SW.ui.toast('Role updated: ' + (r.username || '') + ' → ' + newRole, 'ok');
-          r.role = newRole;
-        } catch (_e) { sel.value = String(r.role); /* toasted (e.g. last owner) */ }
+          await SW.api('/api/users/' + encodeURIComponent(r.id), { method: 'POST', body: { roleId: newRole.id } });
+          SW.ui.toast('Role updated: ' + (r.username || '') + ' → ' + newRole.name, 'ok');
+          r.role = newRole.name;
+          r.roleId = newRole.id;
+          curId = newRole.id;
+        } catch (_e) { sel.value = String(curId); /* toasted (e.g. last keyholder) */ }
       });
       return sel;
     }
@@ -1286,6 +1310,11 @@
     async function load() {
       listBox.textContent = '';
       listBox.append(loading());
+      try {
+        const rr = await SW.api('/api/roles', { toast: false });
+        roles = listOf(rr);
+      } catch (_e) { /* keep whatever we had — roleCell degrades to text */ }
+      syncAddRoleSel();
       let r;
       try { r = await SW.api('/api/users'); }
       catch (_e) {
@@ -1333,8 +1362,11 @@
     const auName = el('input', { class: 'input', type: 'text', placeholder: 'Username', autocomplete: 'off', 'aria-label': 'New username' });
     const auPass = el('input', { class: 'input', type: 'password', placeholder: 'Password', autocomplete: 'new-password', 'aria-label': 'New user password' });
     const auRole = el('select', { class: 'input', 'aria-label': 'New user role' });
-    for (const role of ROLES) auRole.append(el('option', { value: role, text: role }));
-    auRole.value = 'viewer';
+    function syncAddRoleSel() {
+      const prev = auRole.value;
+      const viewer = roles.find((x) => x.builtin && x.name === 'viewer');
+      roleOptions(auRole, prev !== '' ? prev : (viewer ? viewer.id : null));
+    }
     const auBtn = iconBtn('Create user', 'plus', 'primary');
     const form = el('form', { class: 'form-row' },
       el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Username' }), auName),
@@ -1344,7 +1376,7 @@
     auBtn.type = 'submit';
     addCard.append(form, el('div', {
       class: 'hint',
-      text: 'viewer: read-only (no IPs, no actions) · admin: all moderation tools + IPs · owner: everything incl. console, users, settings.',
+      text: 'Prefer an invite link (below) so new admins pick their own password. Roles and their permissions are managed on the Roles page.',
     }));
     view.append(addCard);
 
@@ -1356,18 +1388,387 @@
         SW.ui.toast('Username and password are required', 'error');
         return;
       }
+      const role = roles.find((x) => String(x.id) === auRole.value);
+      if (!role) {
+        SW.ui.toast('Pick a role (is the role list loaded?)', 'error');
+        return;
+      }
       auBtn.disabled = true;
       try {
-        await SW.api('/api/users', { method: 'POST', body: { username, password, role: auRole.value } });
-        SW.ui.toast('User created: ' + username + ' (' + auRole.value + ')', 'ok');
+        await SW.api('/api/users', { method: 'POST', body: { username, password, roleId: role.id } });
+        SW.ui.toast('User created: ' + username + ' (' + role.name + ')', 'ok');
         auName.value = '';
         auPass.value = '';
-        auRole.value = 'viewer';
         load();
       } catch (_e) { /* toasted */ }
       auBtn.disabled = false;
     });
 
+    /* ------------------------------------------------- invites (§2) */
+    const TTL_OPTIONS = [
+      { value: '24', label: '24 hours' },
+      { value: '72', label: '3 days' },
+      { value: '168', label: '7 days' },
+      { value: '720', label: '30 days' },
+    ];
+    const INVITE_BADGE = { unused: 'ok', used: 'accent', expired: 'dim', revoked: 'red' };
+
+    const invCard = el('div', { class: 'card mt-m' });
+    const invTitle = el('div', { class: 'card-title' });
+    invTitle.innerHTML = SW.icon('users');
+    invTitle.append(el('span', { text: 'Invites' }), el('span', { class: 'grow' }));
+    const invBtn = iconBtn('Invite', 'plus', 'primary small');
+    invTitle.append(invBtn);
+    const invBox = el('div');
+    invCard.append(invTitle, invBox, el('div', {
+      class: 'hint',
+      text: 'An invite is a single-use link that lets one person create their own account with the role you pick. The link is shown exactly once.',
+    }));
+    view.append(invCard);
+
+    /* the one-time URL modal — the token never comes back from the server */
+    function showInviteUrl(res) {
+      const url = String((res && res.url) || '');
+      const roleName = (res && res.invite && res.invite.roleName) || '';
+      const body = el('div');
+      body.append(el('p', {
+        class: 'modal-text',
+        text: 'Send this link to your new ' + (roleName || 'panel member') + '. It works once and is shown only now — SquadWatch does not store it.',
+      }));
+      const urlBox = el('div', { class: 'invite-url' });
+      const urlText = el('code');
+      urlText.textContent = url; /* server-built URL — textContent only */
+      urlBox.append(urlText, SW.ui.copyBtn(url, 'Copy'));
+      body.append(urlBox);
+      if (res && res.invite && res.invite.expiresAt) {
+        body.append(el('div', { class: 'hint', text: 'Expires ' + SW.ui.fmtTime(res.invite.expiresAt) + '. You can revoke it below until it is used.' }));
+      }
+      const okBtn = el('button', { type: 'button', class: 'btn primary small', text: 'Done' });
+      body.append(el('div', { class: 'modal-actions' }, okBtn));
+      const m = SW.ui.modal({ title: 'Invite link — copy it now', body });
+      okBtn.addEventListener('click', () => m.close());
+    }
+
+    invBtn.addEventListener('click', async () => {
+      if (!roles.length) { SW.ui.toast('Role list not loaded yet — try again in a moment', 'warn'); return; }
+      const viewer = roles.find((x) => x.builtin && x.name === 'viewer') || roles[0];
+      const v = await SW.ui.confirmModal({
+        title: 'Create invite link',
+        body: 'The link lets one person join the panel with the role you pick.',
+        confirmText: 'Create invite',
+        fields: [
+          { name: 'roleId', label: 'Role', type: 'select', options: roles.map((x) => ({ value: String(x.id), label: x.name })), value: String(viewer.id) },
+          { name: 'ttlHours', label: 'Expires after', type: 'select', options: TTL_OPTIONS, value: '168' },
+        ],
+      });
+      if (!v) return;
+      invBtn.disabled = true;
+      try {
+        const res = await SW.api('/api/invites', { method: 'POST', body: { roleId: Number(v.roleId), ttlHours: Number(v.ttlHours) } });
+        showInviteUrl(res);
+        loadInvites();
+      } catch (_e) { /* toasted */ }
+      invBtn.disabled = false;
+    });
+
+    function revokeCell(r) {
+      if (r.state !== 'unused') return '';
+      const b = el('button', { type: 'button', class: 'btn danger ghost small', text: 'Revoke' });
+      b.addEventListener('click', async () => {
+        const v = await SW.ui.confirmModal({
+          title: 'Revoke invite',
+          body: 'The ' + String(g(r, 'roleName', 'role_name') || '') + ' invite link stops working immediately.',
+          danger: true,
+          confirmText: 'Revoke',
+        });
+        if (!v) return;
+        b.disabled = true;
+        try {
+          await SW.api('/api/invites/' + encodeURIComponent(r.id) + '/revoke', { method: 'POST', body: {} });
+          SW.ui.toast('Invite revoked', 'ok');
+          loadInvites();
+        } catch (_e) { b.disabled = false; /* toasted */ }
+      });
+      return b;
+    }
+
+    async function loadInvites() {
+      invBox.textContent = '';
+      invBox.append(loading());
+      let r;
+      try { r = await SW.api('/api/invites', { toast: false }); }
+      catch (_e) {
+        invBox.textContent = '';
+        invBox.append(el('div', { class: 'dim small', text: 'Could not load invites' }));
+        return;
+      }
+      invBox.textContent = '';
+      const rows = listOf(r);
+      const cols = [
+        { key: 'state', label: 'State', width: '90px', render: (row) => SW.ui.badge(row.state || '?', INVITE_BADGE[row.state] || 'dim') },
+        { key: 'role', label: 'Role', render: (row) => el('span', { class: 'nowrap', text: String(g(row, 'roleName', 'role_name') || '?') }) },
+        {
+          key: 'createdBy', label: 'Created by',
+          render: (row) => { const n = g(row, 'createdByName', 'created_by_name'); return n == null ? 'system' : String(n); },
+        },
+        {
+          key: 'created', label: 'Created', sortable: true,
+          sortVal: (row) => num(g(row, 'createdAt', 'created_at')),
+          render: (row) => SW.ui.timeAgo(g(row, 'createdAt', 'created_at')),
+        },
+        {
+          key: 'expires', label: 'Expires',
+          render: (row) => {
+            const ex = g(row, 'expiresAt', 'expires_at');
+            if (!ex) return 'never';
+            return el('span', { class: 'small nowrap' + (num(ex) < Date.now() ? ' dim' : ''), text: SW.ui.fmtTime(ex) });
+          },
+        },
+        {
+          key: 'usedBy', label: 'Used by',
+          render: (row) => { const n = g(row, 'usedByName', 'used_by_name'); return n == null ? '—' : String(n); },
+        },
+        { key: 'revoke', label: '', render: revokeCell },
+      ];
+      invBox.append(SW.ui.table(cols, rows, {
+        sort: { key: 'created', dir: 'desc' },
+        emptyText: 'No invites yet — the Invite button creates a one-time join link',
+      }));
+    }
+
+    load();
+    loadInvites();
+  }
+
+  /* ============================================================ ROLES view */
+
+  function renderRoles(main) {
+    this.cleanup = () => {};
+    const view = el('div', { class: 'view view-roles' });
+    main.append(view);
+
+    /* viewable with users OR roles; editing needs the roles key (the server
+     * 403s writes anyway — we just hide the buttons) */
+    const canEdit = SW.can('roles');
+    let permCatalog = []; /* GET /api/perms — [{key, group, label}] */
+
+    const topRow = el('div', { class: 'row mb-s' });
+    topRow.append(
+      el('span', { class: 'dim small', text: 'Roles bundle permissions — every user and invite carries exactly one.' }),
+      el('span', { class: 'grow' })
+    );
+    if (canEdit) {
+      const createBtn = iconBtn('Create role', 'plus', 'primary');
+      createBtn.addEventListener('click', () => roleModal(null));
+      topRow.append(createBtn);
+    }
+    const listBox = el('div');
+    view.append(topRow, listBox);
+
+    function grantedCount(role) {
+      const p = (role && role.perms) || {};
+      return Object.keys(p).filter((k) => p[k] === true).length;
+    }
+
+    /* create/edit modal: name + permission checkboxes grouped per /api/perms
+     * group, each group with a select-all. Builtin: name locked. Owner (and
+     * read-only viewers): everything locked, no save. */
+    function roleModal(role) {
+      const isBuiltin = !!(role && role.builtin);
+      const isOwner = isBuiltin && role.name === 'owner';
+      const locked = isOwner || !canEdit;
+      const form = el('form', { class: 'modal-form' });
+
+      const nameInput = el('input', { class: 'input', type: 'text', placeholder: 'e.g. Moderator', maxlength: '32' });
+      if (role) nameInput.value = String(role.name);
+      if (isBuiltin || locked) nameInput.disabled = true;
+      const nameField = el('div', { class: 'field' }, el('label', { text: 'Role name' }), nameInput);
+      if (isBuiltin) {
+        nameField.append(el('div', {
+          class: 'hint',
+          text: isOwner
+            ? 'Builtin role — the owner always holds every permission, including ones added by future updates.'
+            : 'Builtin role — the name is fixed, the permissions are yours to tune.',
+        }));
+      }
+      form.append(nameField);
+
+      const checks = new Map(); /* perm key -> checkbox */
+      const groups = [];
+      for (const p of permCatalog) {
+        let grp = groups.find((x) => x.name === p.group);
+        if (!grp) { grp = { name: p.group, perms: [] }; groups.push(grp); }
+        grp.perms.push(p);
+      }
+      const permGrid = el('div', { class: 'perm-grid' });
+      groups.forEach((grp, gi) => {
+        const gbox = el('div', { class: 'perm-group' });
+        const ghead = el('div', { class: 'perm-group-head' });
+        const gAll = el('input', { type: 'checkbox', id: 'pg-' + gi, 'aria-label': 'Toggle all ' + grp.name + ' permissions' });
+        ghead.append(gAll, el('label', { class: 'perm-group-name', for: 'pg-' + gi, text: grp.name }));
+        gbox.append(ghead);
+        const items = [];
+        for (const p of grp.perms) {
+          const row = el('label', { class: 'perm-item', title: p.key });
+          const cb = el('input', { type: 'checkbox' });
+          cb.checked = isOwner || !!(role && role.perms && role.perms[p.key] === true);
+          if (locked) cb.disabled = true;
+          checks.set(p.key, cb);
+          items.push(cb);
+          row.append(cb, el('span', { text: p.label }));
+          gbox.append(row);
+        }
+        const syncAll = () => {
+          gAll.checked = items.every((c) => c.checked);
+          gAll.indeterminate = !gAll.checked && items.some((c) => c.checked);
+        };
+        syncAll();
+        if (locked) gAll.disabled = true;
+        gAll.addEventListener('change', () => {
+          for (const c of items) c.checked = gAll.checked;
+          syncAll();
+        });
+        for (const c of items) c.addEventListener('change', syncAll);
+        permGrid.append(gbox);
+      });
+      form.append(el('div', { class: 'field' }, el('label', { text: 'Permissions' }), permGrid));
+
+      const actions = el('div', { class: 'modal-actions' });
+      const cancel = el('button', { type: 'button', class: 'btn ghost', text: locked ? 'Close' : 'Cancel' });
+      actions.append(cancel);
+      let okBtn = null;
+      if (!locked) {
+        okBtn = el('button', { type: 'submit', class: 'btn primary', text: role ? 'Save role' : 'Create role' });
+        actions.append(okBtn);
+      }
+      form.append(actions);
+      const m = SW.ui.modal({
+        title: role ? (locked ? 'Role — ' + role.name : 'Edit role — ' + role.name) : 'Create role',
+        body: form, wide: true,
+      });
+      cancel.addEventListener('click', () => m.close());
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (locked) return;
+        const name = nameInput.value.trim();
+        if (!isBuiltin && !name) {
+          nameInput.classList.add('invalid');
+          return;
+        }
+        nameInput.classList.remove('invalid');
+        const perms = {};
+        for (const [k, cb] of checks) { if (cb.checked) perms[k] = true; }
+        /* a perms edit logs every member out (§1) — make that explicit.
+         * Compare as sorted key sets: object key order differs by source. */
+        const cur = (role && role.perms) || {};
+        const curKeys = Object.keys(cur).filter((k) => cur[k] === true).sort().join(',');
+        const permsChanged = !role || curKeys !== Object.keys(perms).sort().join(',');
+        if (role && num(role.members) > 0 && permsChanged) {
+          const n = num(role.members);
+          const sure = await SW.ui.confirmModal({
+            title: 'Save "' + (isBuiltin ? role.name : name) + '"?',
+            body: 'Saving logs out ' + n + ' member' + (n === 1 ? '' : 's') + ' — they sign back in with the new permissions.',
+            danger: true,
+            confirmText: 'Save & sign them out',
+          });
+          if (!sure) return;
+        }
+        if (okBtn) okBtn.disabled = true;
+        try {
+          if (role) {
+            const body = { perms };
+            if (!isBuiltin) body.name = name;
+            await SW.api('/api/roles/' + encodeURIComponent(role.id), { method: 'POST', body });
+            SW.ui.toast('Role saved: ' + (isBuiltin ? role.name : name), 'ok');
+          } else {
+            await SW.api('/api/roles', { method: 'POST', body: { name, perms } });
+            SW.ui.toast('Role created: ' + name, 'ok');
+          }
+          m.close();
+          load();
+        } catch (_e) { if (okBtn) okBtn.disabled = false; /* toasted */ }
+      });
+      if (!locked) setTimeout(() => nameInput.focus(), 30);
+    }
+
+    function actionsCell(r) {
+      const wrap = el('div', { class: 'row gap-s nowrap', style: 'justify-content:flex-end' });
+      const editBtn = el('button', { type: 'button', class: 'btn ghost small', text: canEdit ? 'Edit' : 'View' });
+      editBtn.addEventListener('click', () => roleModal(r));
+      wrap.append(editBtn);
+      if (canEdit) {
+        const delBtn = el('button', { type: 'button', class: 'btn danger ghost small', text: 'Delete' });
+        if (r.builtin) {
+          delBtn.disabled = true;
+          delBtn.title = 'Builtin roles cannot be deleted';
+        } else {
+          delBtn.addEventListener('click', async () => {
+            const v = await SW.ui.confirmModal({
+              title: 'Delete role "' + r.name + '"?',
+              body: 'Only roles with no members and no open invites can be deleted. This cannot be undone.',
+              danger: true,
+              confirmText: 'Delete role',
+            });
+            if (!v) return;
+            delBtn.disabled = true;
+            try {
+              await SW.api('/api/roles/' + encodeURIComponent(r.id) + '/delete', { method: 'POST', body: {} });
+              SW.ui.toast('Role deleted: ' + r.name, 'ok');
+              load();
+            } catch (_e) { delBtn.disabled = false; /* toasted — 409 names the blocker */ }
+          });
+        }
+        wrap.append(delBtn);
+      }
+      return wrap;
+    }
+
+    const cols = [
+      {
+        key: 'name', label: 'Role',
+        render: (r) => {
+          const w = el('span', { class: 'row gap-s nowrap' });
+          w.append(el('b', { text: String(r.name || '?') }));
+          if (r.builtin) w.append(SW.ui.badge('builtin', 'dim'));
+          return w;
+        },
+      },
+      {
+        key: 'perms', label: 'Permissions', align: 'right',
+        render: (r) => grantedCount(r) + ' / ' + (permCatalog.length || '?'),
+      },
+      {
+        key: 'members', label: 'Members', align: 'right', sortable: true,
+        sortVal: (r) => num(r.members),
+        render: (r) => SW.ui.fmtNum(num(r.members)),
+      },
+      {
+        key: 'invites', label: 'Open invites', align: 'right',
+        render: (r) => SW.ui.fmtNum(num(g(r, 'openInvites', 'open_invites'))),
+      },
+      { key: 'actions', label: '', render: actionsCell },
+    ];
+
+    async function load() {
+      listBox.textContent = '';
+      listBox.append(loading());
+      let roleRows;
+      try {
+        const results = await Promise.all([
+          SW.api('/api/perms', { toast: false }),
+          SW.api('/api/roles'),
+        ]);
+        permCatalog = (results[0] && results[0].perms) || [];
+        roleRows = listOf(results[1]);
+      } catch (_e) {
+        listBox.textContent = '';
+        listBox.append(SW.ui.empty('Could not load roles', 'shield'));
+        return;
+      }
+      listBox.textContent = '';
+      listBox.append(SW.ui.table(cols, roleRows, { emptyText: 'No roles' }));
+    }
     load();
   }
 
@@ -1385,7 +1786,7 @@
       try { r = await SW.api('/api/settings'); }
       catch (_e) {
         view.textContent = '';
-        view.append(SW.ui.empty('Could not load settings (owner only)', 'settings'));
+        view.append(SW.ui.empty('Could not load settings (needs the settings permission)', 'settings'));
         return;
       }
       view.textContent = '';
@@ -1414,6 +1815,339 @@
     function build(data) {
       const st = data.status || {};
       const cfg = data.config;
+      const cfgObj = cfg && typeof cfg === 'object' ? cfg : {};
+      const secrets = data.secretsSet || {};
+      const demo = data.demo === true;
+
+      /* =================== editable configuration (§3) ===================
+       * Four cards, each saving its own partial patch via POST /api/settings
+       * (applied live — no restart). Secret fields are never prefilled:
+       * blank = keep (null), Clear = '' (clear), typed text = set. In --demo
+       * mode everything renders disabled (the POST would 403 anyway). */
+
+      let checkSeq = 0;
+      function fieldBox(label, input, hint) {
+        const f = el('div', { class: 'field' });
+        if (label) f.append(el('label', { text: label }));
+        f.append(input);
+        if (hint) f.append(el('div', { class: 'hint', text: hint }));
+        return f;
+      }
+      function textInput(value, o) {
+        o = o || {};
+        const i = el('input', {
+          class: 'input' + (o.mono ? ' mono' : ''),
+          type: o.type || 'text',
+          placeholder: o.placeholder || '',
+          'aria-label': o.label || null,
+        });
+        if (value != null && value !== '') i.value = String(value);
+        if (demo) i.disabled = true;
+        return i;
+      }
+      function numInput(value, o) { return textInput(value, Object.assign({ type: 'number' }, o)); }
+      function checkInput(checked, labelText) {
+        const id = 'set-cb-' + (++checkSeq);
+        const cb = el('input', { type: 'checkbox', id });
+        cb.checked = !!checked;
+        if (demo) cb.disabled = true;
+        const wrap = el('div', { class: 'field field-check' }, cb, el('label', { class: 'check-label', for: id, text: labelText }));
+        return { el: wrap, input: cb };
+      }
+      function secretInput(isSet, ariaLabel) {
+        const keepPh = isSet ? '•••••• saved — leave blank to keep' : 'not set';
+        const i = el('input', { class: 'input grow', type: 'password', autocomplete: 'new-password', placeholder: keepPh, 'aria-label': ariaLabel || 'secret' });
+        if (demo) i.disabled = true;
+        let cleared = false;
+        const clearBtn = el('button', { type: 'button', class: 'btn ghost small', text: 'Clear' });
+        if (demo || !isSet) clearBtn.disabled = true;
+        clearBtn.addEventListener('click', () => {
+          cleared = !cleared;
+          i.value = '';
+          i.disabled = cleared || demo;
+          i.placeholder = cleared ? 'will be cleared on Save' : keepPh;
+          clearBtn.textContent = cleared ? 'Keep saved' : 'Clear';
+        });
+        return {
+          el: el('div', { class: 'row gap-s' }, i, clearBtn),
+          /* null = keep, '' = clear, string = set */
+          value() {
+            if (cleared) return '';
+            return i.value === '' ? null : i.value;
+          },
+        };
+      }
+      function numOrSkip(input, obj, key) {
+        const v = String(input.value).trim();
+        if (v === '') return; /* partial patch — untouched fields stay */
+        obj[key] = Number(v);
+      }
+      async function saveCard(btn, patch) {
+        btn.disabled = true;
+        try {
+          const res = await SW.api('/api/settings', { method: 'POST', body: patch });
+          if (res && res.persistError) {
+            SW.ui.toast('Applied live, but config.json was not written: ' + res.persistError, 'warn', { sticky: true });
+          } else {
+            SW.ui.toast('Saved — applied live', 'ok');
+          }
+        } catch (_e) { /* toasted by SW.api (a 400 lists the validation problems) */ }
+        btn.disabled = false;
+      }
+
+      if (demo) {
+        const note = el('div', { class: 'notice-banner' });
+        note.append(el('span', { class: 'notice-icon', html: SW.icon('lock') }));
+        note.append(el('span', { class: 'grow', text: 'Demo settings are fixed — every field below is read-only. Run SquadWatch without --demo to link your own server.' }));
+        view.append(note);
+      }
+
+      /* ---- Squad server ---- */
+      const sq = cfgObj.squad || {};
+      const svCard = el('div', { class: 'card' });
+      svCard.append(cardTitle('radio', 'Squad server'));
+      if (!demo && !data.linked && !(st.rcon && st.rcon.connected)) {
+        const co = el('div', { class: 'callout' });
+        co.innerHTML = SW.icon('radio');
+        co.append(el('span', { text: 'No Squad server linked yet — enter your RCON details, hit Test connection, then Save.' }));
+        svCard.append(co);
+      }
+      const svHost = textInput(sq.rconHost, { placeholder: 'e.g. 203.0.113.10', mono: true, label: 'RCON host' });
+      const svPort = numInput(sq.rconPort, { placeholder: '21114', label: 'RCON port' });
+      const svPass = secretInput(!!secrets.rconPassword, 'RCON password');
+      svCard.append(el('div', { class: 'form-row' },
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'RCON host' }), svHost),
+        el('div', { class: 'field', style: 'margin:0;max-width:130px' }, el('label', { text: 'RCON port' }), svPort)
+      ));
+      svCard.append(fieldBox('RCON password', svPass.el, 'Leave blank to keep the saved password.'));
+      const svTest = iconBtn('Test connection', 'live', 'ghost small');
+      const svTestOut = el('span', { class: 'small test-result' });
+      const svSave = iconBtn('Save', 'check', 'primary small');
+      if (demo) { svTest.disabled = true; svSave.disabled = true; }
+      svCard.append(el('div', { class: 'row mt-s' }, svTest, svTestOut, el('span', { class: 'grow' }), svSave));
+
+      /* one-shot probe — never touches the live RCON client */
+      svTest.addEventListener('click', async () => {
+        const host = svHost.value.trim();
+        const port = Number(svPort.value);
+        if (!host || !port) { SW.ui.toast('Enter the RCON host and port first', 'warn'); return; }
+        svTest.disabled = true;
+        svTestOut.className = 'small test-result dim';
+        svTestOut.textContent = 'connecting…';
+        let res;
+        try {
+          res = await SW.api('/api/settings/test', {
+            method: 'POST', toast: false,
+            body: { rconHost: host, rconPort: port, rconPassword: svPass.value() },
+          });
+        } catch (err) {
+          res = { ok: false, error: (err && err.message) || 'connection failed' };
+        }
+        if (res && res.ok) {
+          svTestOut.className = 'small test-result good';
+          svTestOut.textContent = 'Connected: ' + (res.serverName || 'unknown server') + (res.players != null ? ', ' + res.players + ' players' : '');
+        } else {
+          svTestOut.className = 'small test-result bad';
+          svTestOut.textContent = (res && res.error) || 'connection failed';
+        }
+        svTest.disabled = false;
+      });
+
+      svSave.addEventListener('click', () => {
+        const patch = { squad: { rconHost: svHost.value.trim(), rconPassword: svPass.value() } };
+        numOrSkip(svPort, patch.squad, 'rconPort');
+        saveCard(svSave, patch);
+      });
+
+      /* ---- Game log source ---- */
+      const lgC = cfgObj.log || {};
+      const ftpC = lgC.ftp || {};
+      const sftpC = lgC.sftp || {};
+      const srcCard = el('div', { class: 'card' });
+      srcCard.append(cardTitle('scroll', 'Game log source'));
+      const modeSel = el('select', { class: 'input', 'aria-label': 'Log source mode' });
+      for (const mName of ['local', 'ftp', 'sftp']) modeSel.append(el('option', { value: mName, text: mName }));
+      modeSel.value = lgC.mode === 'ftp' || lgC.mode === 'sftp' ? lgC.mode : 'local';
+      if (demo) modeSel.disabled = true;
+      srcCard.append(fieldBox('Mode', modeSel));
+
+      const localPath = textInput(lgC.path, { mono: true, placeholder: '…\\SquadGame\\Saved\\Logs\\SquadGame.log', label: 'Log file path' });
+      const localBox = el('div', {}, fieldBox('SquadGame.log path', localPath));
+
+      const ftpHost = textInput(ftpC.host, { mono: true, label: 'FTP host' });
+      const ftpPort = numInput(ftpC.port, { placeholder: '21', label: 'FTP port' });
+      const ftpUser = textInput(ftpC.user, { label: 'FTP user' });
+      const ftpPass = secretInput(!!secrets.ftpPassword, 'FTP password');
+      const ftpPath = textInput(ftpC.path, { mono: true, label: 'FTP remote log path' });
+      const ftpSecure = checkInput(ftpC.secure, 'FTPS (encrypted) — strongly recommended');
+      const ftpBox = el('div', { class: 'hidden' },
+        el('div', { class: 'form-row' },
+          el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Host' }), ftpHost),
+          el('div', { class: 'field', style: 'margin:0;max-width:110px' }, el('label', { text: 'Port' }), ftpPort)
+        ),
+        fieldBox('User', ftpUser),
+        fieldBox('Password', ftpPass.el),
+        fieldBox('Remote log path', ftpPath),
+        ftpSecure.el,
+        el('div', { class: 'hint', text: 'ftp mode needs the optional basic-ftp npm package — install name is in the README.' })
+      );
+
+      const sftpHost = textInput(sftpC.host, { mono: true, label: 'SFTP host' });
+      const sftpPort = numInput(sftpC.port, { placeholder: '22', label: 'SFTP port' });
+      const sftpUser = textInput(sftpC.user, { label: 'SFTP user' });
+      const sftpPass = secretInput(!!secrets.sftpPassword, 'SFTP password');
+      const sftpKey = textInput(sftpC.privateKeyPath, { mono: true, label: 'SFTP private key path' });
+      const sftpPath = textInput(sftpC.path, { mono: true, label: 'SFTP remote log path' });
+      const sftpBox = el('div', { class: 'hidden' },
+        el('div', { class: 'form-row' },
+          el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Host' }), sftpHost),
+          el('div', { class: 'field', style: 'margin:0;max-width:110px' }, el('label', { text: 'Port' }), sftpPort)
+        ),
+        fieldBox('User', sftpUser),
+        fieldBox('Password', sftpPass.el, 'Or point at a private key below.'),
+        fieldBox('Private key path', sftpKey),
+        fieldBox('Remote log path', sftpPath),
+        el('div', { class: 'hint', text: 'sftp mode needs the optional ssh2-sftp-client npm package — install name is in the README.' })
+      );
+      srcCard.append(localBox, ftpBox, sftpBox);
+
+      function syncModeBoxes() {
+        localBox.classList.toggle('hidden', modeSel.value !== 'local');
+        ftpBox.classList.toggle('hidden', modeSel.value !== 'ftp');
+        sftpBox.classList.toggle('hidden', modeSel.value !== 'sftp');
+      }
+      modeSel.addEventListener('change', syncModeBoxes);
+      syncModeBoxes();
+
+      const srcPoll = numInput(lgC.pollMs, { placeholder: '1500', label: 'Poll interval ms' });
+      const srcTz = numInput(lgC.timezoneOffsetMinutes, { placeholder: '0', label: 'Timezone offset minutes' });
+      const srcBackfill = checkInput(lgC.backfill, 'Backfill — parse the whole existing log on start');
+      srcCard.append(el('div', { class: 'form-row' },
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Poll interval (ms)' }), srcPoll),
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Timezone offset (min)' }), srcTz)
+      ), srcBackfill.el);
+      function buildLogSettings() {
+        const lg = { mode: modeSel.value, backfill: srcBackfill.input.checked };
+        numOrSkip(srcPoll, lg, 'pollMs');
+        numOrSkip(srcTz, lg, 'timezoneOffsetMinutes');
+        if (modeSel.value === 'local') lg.path = localPath.value.trim();
+        if (modeSel.value === 'ftp') {
+          lg.ftp = { host: ftpHost.value.trim(), user: ftpUser.value.trim(), path: ftpPath.value.trim(), secure: ftpSecure.input.checked, password: ftpPass.value() };
+          numOrSkip(ftpPort, lg.ftp, 'port');
+        }
+        if (modeSel.value === 'sftp') {
+          lg.sftp = { host: sftpHost.value.trim(), user: sftpUser.value.trim(), privateKeyPath: sftpKey.value.trim(), path: sftpPath.value.trim(), password: sftpPass.value() };
+          numOrSkip(sftpPort, lg.sftp, 'port');
+        }
+        return lg;
+      }
+      const srcTest = iconBtn('Test', 'live', 'ghost small');
+      const srcTestOut = el('span', { class: 'small test-result' });
+      const srcSave = iconBtn('Save', 'check', 'primary small');
+      if (demo) { srcTest.disabled = true; srcSave.disabled = true; }
+      srcCard.append(el('div', { class: 'row mt-s' }, srcTest, srcTestOut, el('span', { class: 'grow' }), srcSave));
+      srcTest.addEventListener('click', async () => {
+        srcTest.disabled = true;
+        srcTestOut.className = 'small test-result dim';
+        srcTestOut.textContent = 'checking…';
+        let res;
+        try {
+          res = await SW.api('/api/settings/test', { method: 'POST', toast: false, body: { log: buildLogSettings() } });
+        } catch (err) {
+          res = { ok: false, error: (err && err.message) || 'check failed' };
+        }
+        if (res && res.ok) {
+          srcTestOut.className = 'small test-result good';
+          srcTestOut.textContent = 'Log found' + (res.sizeBytes != null ? ' — ' + SW.ui.fmtNum(res.sizeBytes) + ' bytes' : '');
+        } else {
+          srcTestOut.className = 'small test-result bad';
+          srcTestOut.textContent = (res && res.error) || 'check failed';
+        }
+        srcTest.disabled = false;
+      });
+      srcSave.addEventListener('click', () => {
+        saveCard(srcSave, { log: buildLogSettings() });
+      });
+
+      /* ---- Integrations ---- */
+      const weC = cfgObj.webhookEvents || {};
+      const intCard = el('div', { class: 'card' });
+      intCard.append(cardTitle('broadcast', 'Integrations'));
+      const intHook = secretInput(!!secrets.discordWebhook, 'Discord webhook URL');
+      const weDefs = [['flags', 'Flags'], ['bans', 'Bans'], ['kicks', 'Kicks'], ['warns', 'Warns'], ['matchEnd', 'Match end']];
+      const weChecks = weDefs.map((d) => ({ key: d[0], check: checkInput(weC[d[0]], d[1]) }));
+      const intKey = secretInput(!!secrets.steamApiKey, 'Steam API key');
+      intCard.append(
+        fieldBox('Discord webhook URL', intHook.el, 'Event notifications are posted here.'),
+        el('div', { class: 'field' }, el('label', { text: 'Send events for' }),
+          el('div', { class: 'row-wrap' }, weChecks.map((x) => x.check.el))),
+        fieldBox('Steam API key', intKey.el, 'Used to enrich player profiles.')
+      );
+      const intSave = iconBtn('Save', 'check', 'primary small');
+      if (demo) intSave.disabled = true;
+      intCard.append(el('div', { class: 'row mt-s' }, el('span', { class: 'grow' }), intSave));
+      intSave.addEventListener('click', () => {
+        const patch = { discordWebhook: intHook.value(), steamApiKey: intKey.value(), webhookEvents: {} };
+        for (const x of weChecks) patch.webhookEvents[x.key] = x.check.input.checked;
+        saveCard(intSave, patch);
+      });
+
+      /* ---- Detection & housekeeping ---- */
+      const flC = cfgObj.flags || {};
+      const rtC = cfgObj.retention || {};
+      const webC = cfgObj.web || {};
+      const hkCard = el('div', { class: 'card' });
+      hkCard.append(cardTitle('flag', 'Detection & housekeeping'));
+      const hkSpree = numInput(flC.tkSpreeCount, { placeholder: '3', label: 'TK spree count' });
+      const hkSpreeWin = numInput(flC.tkSpreeWindowSec, { placeholder: '180', label: 'TK spree window seconds' });
+      const hkMass = numInput(flC.massTkCount, { placeholder: '5', label: 'Mass TK count' });
+      const hkNewMin = numInput(flC.newPlayerMinutes, { placeholder: '15', label: 'New player minutes' });
+      hkCard.append(el('div', { class: 'form-row' },
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'TK spree count' }), hkSpree),
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'TK spree window (s)' }), hkSpreeWin)
+      ));
+      hkCard.append(el('div', { class: 'form-row' },
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Mass TK count' }), hkMass),
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'New player (min)' }), hkNewMin)
+      ));
+      const hkWatch = el('textarea', { class: 'input mono', rows: '3', placeholder: 'one pattern per line', 'aria-label': 'Chat watchlist patterns' });
+      if (Array.isArray(flC.chatWatchlist) && flC.chatWatchlist.length) hkWatch.value = flC.chatWatchlist.join('\n');
+      if (demo) hkWatch.disabled = true;
+      hkCard.append(fieldBox('Chat watchlist', hkWatch, 'One pattern per line — chat matching any of them raises a flag.'));
+      const hkAuto = checkInput(cfgObj.autoWarnTeamkiller, 'Auto-warn teamkillers');
+      const hkAutoMsg = textInput(cfgObj.autoWarnMessage, { placeholder: 'Teamkill detected: {victim}…', label: 'Auto-warn message' });
+      hkCard.append(hkAuto.el, fieldBox('Auto-warn message', hkAutoMsg, '{victim} is replaced with the victim\'s name.'));
+      const hkChatDays = numInput(rtC.chatDays, { placeholder: '0', label: 'Chat retention days' });
+      const hkPopDays = numInput(rtC.popDays, { placeholder: '30', label: 'Population retention days' });
+      hkCard.append(el('div', { class: 'form-row' },
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Chat retention (days, 0 = keep)' }), hkChatDays),
+        el('div', { class: 'field grow', style: 'margin:0' }, el('label', { text: 'Pop samples (days)' }), hkPopDays)
+      ));
+      const hkPublic = textInput(webC.publicUrl, { mono: true, placeholder: 'https://panel.example.com', label: 'Public URL' });
+      hkCard.append(fieldBox('Public URL', hkPublic, 'Used to build invite links; leave blank to use the request origin.'));
+      const hkSave = iconBtn('Save', 'check', 'primary small');
+      if (demo) hkSave.disabled = true;
+      hkCard.append(el('div', { class: 'row mt-s' }, el('span', { class: 'grow' }), hkSave));
+      hkSave.addEventListener('click', () => {
+        const lines = hkWatch.value.split('\n').map((s) => s.trim()).filter(Boolean);
+        const patch = {
+          flags: { chatWatchlist: lines },
+          autoWarnTeamkiller: hkAuto.input.checked,
+          autoWarnMessage: hkAutoMsg.value,
+          retention: {},
+          web: { publicUrl: hkPublic.value.trim() },
+        };
+        numOrSkip(hkSpree, patch.flags, 'tkSpreeCount');
+        numOrSkip(hkSpreeWin, patch.flags, 'tkSpreeWindowSec');
+        numOrSkip(hkMass, patch.flags, 'massTkCount');
+        numOrSkip(hkNewMin, patch.flags, 'newPlayerMinutes');
+        numOrSkip(hkChatDays, patch.retention, 'chatDays');
+        numOrSkip(hkPopDays, patch.retention, 'popDays');
+        if (!Object.keys(patch.retention).length) delete patch.retention;
+        saveCard(hkSave, patch);
+      });
+
+      view.append(el('div', { class: 'settings-grid' }, svCard, srcCard, intCard, hkCard));
 
       /* --- status cards --- */
       const rconCard = el('div', { class: 'card' });
@@ -1465,7 +2199,8 @@
         ['Squad server', gameVer || 'unknown'],
       ]));
 
-      view.append(el('div', { class: 'status-grid' }, rconCard, logCard, dbCard, verCard));
+      view.append(SW.ui.section('Status & diagnostics',
+        el('div', { class: 'status-grid' }, rconCard, logCard, dbCard, verCard)));
 
       /* live status refresh (same payload as the topbar dots) */
       unsubs.push(SW.live.on('status', (s) => {
@@ -1534,37 +2269,46 @@
   /* ========================================================== route table */
 
   SW.routes.admin = {
-    role: 'admin',
+    perm: ['broadcast', 'layer', 'match', 'squad', 'team', 'warn', 'kick', 'ban'],
     render(main, ctx) { renderAdmin.call(this, main, ctx); },
     cleanup() {},
   };
 
   SW.routes.console = {
-    role: 'owner',
+    perm: 'raw',
     render(main, ctx) { renderConsole.call(this, main, ctx); },
     cleanup() {},
   };
 
   SW.routes.bans = {
-    role: 'admin',
+    // Readable with plain view (the API serves the list to any view holder,
+    // and the dashboard's Active-bans card links here); the nav entry and
+    // every action on the page still gate on the ban perm.
+    perm: 'view',
     render(main, ctx) { renderBans.call(this, main, ctx); },
     cleanup() {},
   };
 
   SW.routes.audit = {
-    role: 'admin',
+    perm: 'audit',
     render(main, ctx) { renderAudit.call(this, main, ctx); },
     cleanup() {},
   };
 
   SW.routes.users = {
-    role: 'owner',
+    perm: 'users',
     render(main, ctx) { renderUsers.call(this, main, ctx); },
     cleanup() {},
   };
 
+  SW.routes.roles = {
+    perm: ['roles', 'users'], /* read access feeds the Users UI (§1) */
+    render(main, ctx) { renderRoles.call(this, main, ctx); },
+    cleanup() {},
+  };
+
   SW.routes.settings = {
-    role: 'owner',
+    perm: 'settings',
     render(main, ctx) { renderSettings.call(this, main, ctx); },
     cleanup() {},
   };

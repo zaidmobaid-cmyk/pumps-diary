@@ -8,12 +8,12 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
 const { log } = require('./util');
-const { loadConfig } = require('./config');
+const { loadConfig, applySettingsPatch, persistUserConfig } = require('./config');
 const { openDb } = require('./db');
 const { createAuth } = require('./auth');
 const LiveState = require('./state');
 const SquadRcon = require('./rcon');
-const { createLogSource } = require('./logsource');
+const { createLogSource, modeAvailable } = require('./logsource');
 const parser = require('./parser');
 const Ingest = require('./ingest');
 const { createAdmin } = require('./admin');
@@ -71,7 +71,14 @@ async function main() {
     cfg.log = Object.assign({}, cfg.log, { mode: 'local', path: demo.logPath, backfill: true, pollMs: 700 });
     cfg.dbPath = path.join(dataDir, 'demo.db');
     if (!cfg.web) cfg.web = {};
-    if (!cfg.web.host) cfg.web.host = '127.0.0.1';
+    // Always bind demo to loopback: config defaults set web.host to 0.0.0.0,
+    // and /api/bootstrap serves the owner-setup token in demo (SPEC §19.3.15
+    // allows that only because demo stays local).
+    cfg.web.host = '127.0.0.1';
+    // Demo fabricates flags/kicks/players nonstop — never deliver them to a
+    // real config.json's Discord channel or burn its Steam API key.
+    cfg.discordWebhook = '';
+    cfg.steamApiKey = '';
   }
   if (Number.isFinite(args.port)) cfg.web.port = args.port;
   if (cfg.demo === true && !args.demo) {
@@ -131,19 +138,31 @@ async function main() {
   };
 
   // ------------------------------------------------------------- log source
-  const logsource = createLogSource(cfg.log, { dataDir });
-  const tzOff = (cfg.log && cfg.log.timezoneOffsetMinutes) || 0;
-  logsource.on('line', (line) => {
-    try {
-      const ev = parser.parseLogLine(line, tzOff);
-      if (ev) bus.emit('log-event', ev);
-      else recordUnmatched(line);
-    } catch (e) {
-      log.warn('parser', `threw on line: ${e.message}`);
-      recordUnmatched(line);
-    }
-  });
-  logsource.on('status', (s) => bus.emit('log-status', s));
+  // Swappable: saving new log settings replaces the instance (its mode/path
+  // are baked at construction) while the web server and ingest stay up.
+  const src = { logsource: null };
+  const tzOff = () => Number((cfg.log && cfg.log.timezoneOffsetMinutes) || 0);
+  function logConfigured() {
+    const l = cfg.log || {};
+    if (l.mode === 'ftp') return !!(l.ftp && l.ftp.host);
+    if (l.mode === 'sftp') return !!(l.sftp && l.sftp.host);
+    return !!l.path; // local
+  }
+  function attachLogsource(ls) {
+    ls.on('line', (line) => {
+      try {
+        const ev = parser.parseLogLine(line, tzOff());
+        if (ev) bus.emit('log-event', ev);
+        else recordUnmatched(line);
+      } catch (e) {
+        log.warn('parser', `threw on line: ${e.message}`);
+        recordUnmatched(line);
+      }
+    });
+    ls.on('status', (s) => bus.emit('log-status', s));
+    return ls;
+  }
+  src.logsource = attachLogsource(createLogSource(cfg.log, { dataDir }));
 
   // ---------------------------------------------------------------- rcon i/o
   rcon.on('chat-packet', (body) => {
@@ -167,19 +186,11 @@ async function main() {
   ingest.startTimers();
 
   // ------------------------------------------------------ steam + webhook
-  const steam = createSteam({ db, config: cfg, state });
+  let steam = createSteam({ db, config: cfg, state });
   if (steam && typeof steam.start === 'function') steam.start();
-  const webhook = createWebhook({ config: cfg, bus });
-  bus.on('flag', (f) => { try { webhook.postFlag(f); } catch (_e) { /* fire and forget */ } });
-  bus.on('match-end', (m) => { try { webhook.postMatchEnd(m); } catch (_e) { /* */ } });
-  bus.on('admin-action', (row) => {
-    try {
-      if (!row || !row.action) return;
-      if (row.action === 'kick') webhook.postKick(row);
-      else if (row.action === 'ban') webhook.postBan(row);
-      else if (row.action === 'warn') webhook.postWarn(row);
-    } catch (_e) { /* fire and forget */ }
-  });
+  // createWebhook self-wires its bus listeners (flag / match-end /
+  // admin-action) — wiring them again here double-posted every Discord alert.
+  createWebhook({ config: cfg, bus });
 
   // ---------------------------------------------------------------- pollers
   const timers = [];
@@ -246,13 +257,197 @@ async function main() {
   timers.push(setInterval(pollNextMap, 60000));
   timers.push(setInterval(refreshLayers, 6 * 3600 * 1000));
 
+  // ------------------------------------- runtime settings (docs/R-I-S §3)
+  // The Settings API changes cfg IN PLACE (ingest/webhook/api read it live),
+  // persists to config.json, and re-points the live pieces: the SAME rcon
+  // instance is retargeted (api/admin/pollers hold it by closure), the
+  // logsource is swapped via the src holder, steam is rebuilt on key change.
+  function applySettings(patch) {
+    if (args.demo) throw new Error('demo settings are fixed');
+    // Refuse an ftp/sftp save while its optional package is missing BEFORE
+    // anything is applied or persisted — otherwise the change half-applies
+    // (cfg + config.json already switched, logsource dead) and the next boot
+    // would trip over the same throw.
+    const candidateMode = patch && patch.log && typeof patch.log.mode === 'string'
+      ? patch.log.mode : cfg.log.mode;
+    if (candidateMode === 'ftp' || candidateMode === 'sftp') {
+      const avail = modeAvailable(candidateMode);
+      if (!avail.ok) throw new Error(avail.error);
+    }
+    const res = applySettingsPatch(cfg, patch);
+    if (!res.changedPaths.length) return res;
+    try {
+      persistUserConfig(configPath, res.changedPaths, cfg);
+    } catch (e) {
+      log.warn('settings', `config.json write failed: ${e.message}`);
+      res.persistError = e.message;
+    }
+    const touched = (prefix) => res.changedPaths.some((p) => p === prefix || p.startsWith(prefix + '.'));
+    if (touched('squad')) {
+      rcon.close();
+      rcon.host = cfg.squad.rconHost;
+      rcon.port = cfg.squad.rconPort;
+      rcon.password = cfg.squad.rconPassword;
+      if (cfg.squad.rconHost) rcon.connect(); // also recovers a bad-password stop
+      else bus.emit('rcon-status');
+    }
+    if (touched('log')) {
+      const old = src.logsource;
+      try { old.stop(); } catch (_e) { /* */ }
+      // A tick in flight when stop() lands may still emit: detach so the dying
+      // instance can neither double-ingest lines nor overwrite the status the
+      // new instance is about to report.
+      old.removeAllListeners('line');
+      old.removeAllListeners('status');
+      bus.emit('log-status', { mode: cfg.log.mode, ok: null });
+      src.logsource = attachLogsource(createLogSource(cfg.log, { dataDir }));
+      if (logConfigured()) {
+        try {
+          src.logsource.start();
+        } catch (e) {
+          log.error('settings', `log source failed to start: ${e.message}`);
+          bus.emit('log-status', { mode: cfg.log.mode, ok: false, error: e.message });
+        }
+      }
+    }
+    if (touched('steamApiKey')) {
+      try { if (steam && steam.stop) steam.stop(); } catch (_e) { /* */ }
+      steam = createSteam({ db, config: cfg, state });
+      if (steam && typeof steam.start === 'function') steam.start();
+    }
+    if (touched('flags.chatWatchlist') && typeof ingest.refreshWatchlist === 'function') {
+      ingest.refreshWatchlist();
+    }
+    log.info('settings', `applied: ${res.changedPaths.join(', ')}`);
+    return res;
+  }
+
+  // One-shot RCON probe with candidate credentials — its own throwaway client,
+  // the live connection is never touched. null password = use the saved one.
+  function testRcon({ host, port, password } = {}) {
+    const h = String(host == null ? '' : host).trim();
+    const p = Number(port);
+    if (!h || !Number.isInteger(p) || p < 1 || p > 65535) {
+      return Promise.resolve({ ok: false, error: 'enter the RCON host and port first' });
+    }
+    // null/absent = saved password; '' tests a genuinely empty password, the
+    // same meaning '' has when saving (clear) — Test must validate what Save
+    // would produce.
+    const pass = password == null ? cfg.squad.rconPassword : String(password);
+    return new Promise((resolve) => {
+      const probe = new SquadRcon({ host: h, port: p, password: pass });
+      let done = false;
+      let timer = null;
+      const finish = (out) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { probe.close(); } catch (_e) { /* */ }
+        resolve(out);
+      };
+      timer = setTimeout(() => finish({ ok: false, error: 'timed out — host unreachable, port closed, or not an RCON port' }), 8000);
+      probe.on('error', (e) => {
+        const m = e && e.message ? String(e.message) : 'connection failed';
+        if (/auth failed/i.test(m)) finish({ ok: false, error: 'connected, but the RCON password is wrong' });
+        // other socket errors: keep waiting — the dial timeout reports once
+      });
+      probe.on('connected', () => {
+        probe.exec('ShowServerInfo', 6000).then((body) => {
+          let info = null;
+          try { info = parser.parseServerInfo(body); } catch (_e) { info = null; }
+          finish({
+            ok: true,
+            serverName: (info && info.serverName) || null,
+            players: info && info.playerCount != null ? info.playerCount : null,
+          });
+        }).catch((e) => finish({ ok: false, error: `connected and authed, but ShowServerInfo failed: ${e.message}` }));
+      });
+      probe.connect();
+    });
+  }
+
+  // One-shot log-source probe (docs/R-I-S §3): local = stat the file; ftp/sftp
+  // = dep check, then connect + stat. Patch semantics mirror save: null/absent
+  // field = use the saved value.
+  async function testLog(logPatch) {
+    const given = logPatch || {};
+    const mode = typeof given.mode === 'string' && given.mode ? given.mode : cfg.log.mode;
+    if (mode === 'local') {
+      const p = String(given.path != null ? given.path : cfg.log.path || '');
+      if (!p) return { ok: false, error: 'enter the SquadGame.log path first' };
+      try {
+        const st = fs.statSync(p);
+        return { ok: true, sizeBytes: st.size };
+      } catch (e) {
+        return { ok: false, error: `cannot read ${p}: ${e.code || e.message}` };
+      }
+    }
+    if (mode !== 'ftp' && mode !== 'sftp') return { ok: false, error: `unknown log mode "${mode}"` };
+    const avail = modeAvailable(mode);
+    if (!avail.ok) return { ok: false, error: avail.error };
+    const patchSub = {};
+    const sub0 = given[mode] || {};
+    for (const k of Object.keys(sub0)) if (sub0[k] != null) patchSub[k] = sub0[k];
+    const sub = Object.assign({}, cfg.log[mode], patchSub);
+    if (!sub.host) return { ok: false, error: 'enter the host first' };
+    if (!sub.path) return { ok: false, error: 'enter the remote log path first' };
+    try {
+      if (mode === 'ftp') {
+        const ftpLib = require('basic-ftp');
+        const client = new ftpLib.Client(8000);
+        try {
+          await client.access({
+            host: sub.host, port: sub.port || 21, user: sub.user,
+            password: sub.password, secure: !!sub.secure,
+          });
+          const size = await client.size(sub.path);
+          return { ok: true, sizeBytes: size };
+        } finally {
+          client.close();
+        }
+      }
+      const SftpClient = require('ssh2-sftp-client');
+      const client = new SftpClient();
+      try {
+        await client.connect({
+          host: sub.host, port: sub.port || 22, username: sub.user,
+          password: sub.password || undefined,
+          privateKey: sub.privateKeyPath ? fs.readFileSync(sub.privateKeyPath) : undefined,
+          readyTimeout: 8000,
+        });
+        const st = await client.stat(sub.path);
+        return { ok: true, sizeBytes: st.size };
+      } finally {
+        try { await client.end(); } catch (_e) { /* */ }
+      }
+    } catch (e) {
+      return { ok: false, error: e && e.message ? e.message : 'connection failed' };
+    }
+  }
+
   // -------------------------------------------------------------------- api
   // demoCli is deliberately the CLI flag, never cfg.demo: config.json must not
   // be able to turn on demo-only conveniences like the bootstrap setup token.
-  const api = createApi({ db, state, ingest, rcon, bus, auth, admin, config: cfg, parserHealth, version: VERSION, demoCli: args.demo });
+  const api = createApi({
+    db, state, ingest, rcon, bus, auth, admin, config: cfg, parserHealth,
+    version: VERSION, demoCli: args.demo,
+    runtime: { applySettings, testRcon, testLog },
+  });
 
-  rcon.connect();
-  logsource.start();
+  if (cfg.squad.rconHost) rcon.connect();
+  else log.info('boot', 'no Squad server linked yet — open Settings in the panel to connect one');
+  if (logConfigured()) {
+    // Never let the log source take the whole panel down (a missing optional
+    // ftp/sftp package, a bad path): boot on, report it in the status strip.
+    try {
+      src.logsource.start();
+    } catch (e) {
+      log.error('boot', `log source failed to start: ${e.message} — fix it in Settings`);
+      bus.emit('log-status', { mode: cfg.log.mode, ok: false, error: e.message });
+    }
+  } else {
+    log.info('boot', 'log source not configured — set it in Settings to enable kill/chat tracking');
+  }
 
   const host = cfg.web.host || '0.0.0.0';
   const port = cfg.web.port || 8787;
@@ -264,7 +459,8 @@ async function main() {
   const shownHost = host === '0.0.0.0' ? 'localhost' : host;
   log.info('boot', '────────────────────────────────────────────────');
   log.info('boot', `SquadWatch v${VERSION} up: http://${shownHost}:${port}${cfg.demo ? '  (DEMO MODE)' : ''}`);
-  log.info('boot', `db: ${dbPath} (${db.backend})  ·  log: ${cfg.log.mode}  ·  rcon: ${cfg.squad.rconHost}:${cfg.squad.rconPort}`);
+  const rconShown = cfg.squad.rconHost ? `${cfg.squad.rconHost}:${cfg.squad.rconPort}` : 'not linked (set in Settings)';
+  log.info('boot', `db: ${dbPath} (${db.backend})  ·  log: ${cfg.log.mode}  ·  rcon: ${rconShown}`);
   if (auth.setupToken) {
     log.info('boot', `FIRST RUN — create the owner account in the browser. Setup token: ${auth.setupToken}`);
   }
@@ -277,7 +473,7 @@ async function main() {
     shuttingDown = true;
     log.info('boot', `${sig} — shutting down`);
     for (const t of timers) clearInterval(t);
-    try { logsource.stop(); } catch (_e) { /* */ }
+    try { src.logsource.stop(); } catch (_e) { /* */ }
     try { if (ingest.stop) ingest.stop(); else ingest.stopTimers(); } catch (_e) { /* */ }
     try { if (steam && steam.stop) steam.stop(); } catch (_e) { /* */ }
     try { rcon.close(); } catch (_e) { /* */ }

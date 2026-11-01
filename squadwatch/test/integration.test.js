@@ -442,6 +442,95 @@ test('integration: full boot — MockSquad + real server + HTTP/SSE scenario (SP
       const actions = audit.json.rows.map((r) => r.action);
       assert.ok(actions.includes('kick') && actions.includes('raw'), 'kick + raw audited');
 
+      // ------------------------ (8b) custom roles + invites, end to end
+      step('custom role + invite: create, join, granular enforcement');
+      const permsRes = await api(owner, 'GET', '/api/perms');
+      assert.strictEqual(permsRes.status, 200);
+      assert.ok(permsRes.json.perms.some((p) => p.key === 'kick'), 'perm catalog lists kick');
+
+      const mkRole = await api(owner, 'POST', '/api/roles', {
+        name: 'Trial Mod', perms: { view: true, stream: true, kick: true, nonsense: true },
+      });
+      assert.strictEqual(mkRole.status, 200, `role create: ${mkRole.text}`);
+      const trialRoleId = mkRole.json.role.id;
+      assert.strictEqual(mkRole.json.role.perms.nonsense, undefined, 'unknown perm keys are dropped');
+
+      const mkInv = await api(owner, 'POST', '/api/invites', { roleId: trialRoleId, ttlHours: 24 });
+      assert.strictEqual(mkInv.status, 200, `invite create: ${mkInv.text}`);
+      assert.match(mkInv.json.token, /^[0-9a-f]{64}$/, 'full token returned once');
+      assert.ok(String(mkInv.json.url).includes('/#/join/'), 'join url returned');
+
+      const peek = await api(null, 'GET', `/api/join?token=${mkInv.json.token}`);
+      assert.strictEqual(peek.status, 200);
+      assert.strictEqual(peek.json.valid, true, 'invite peek: valid');
+      assert.strictEqual(peek.json.roleName, 'Trial Mod');
+
+      const trial = { cookie: null };
+      const joined = await api(trial, 'POST', '/api/join', {
+        token: mkInv.json.token, username: 'trial', password: 'trialpass123',
+      });
+      assert.strictEqual(joined.status, 200, `join: ${joined.text}`);
+      assert.strictEqual(joined.json.user.role, 'Trial Mod');
+      assert.strictEqual(joined.json.user.perms.kick, true, 'joined user carries role perms');
+      assert.ok(trial.cookie, 'join auto-logs-in with a session cookie');
+
+      const reuse = await api({ cookie: null }, 'POST', '/api/join', {
+        token: mkInv.json.token, username: 'trial2', password: 'trialpass123',
+      });
+      assert.strictEqual(reuse.status, 400, 'an invite is single-use');
+
+      // Granted: kick goes through the real RCON path against the mock.
+      const erikRow = (await api(trial, 'GET', '/api/players?q=Erik')).json.rows[0];
+      assert.ok(erikRow, 'Erik visible to the trial mod (view granted)');
+      const tKick = await api(trial, 'POST', '/api/admin/kick', { playerId: erikRow.id, reason: 'trial mod kick' });
+      assert.strictEqual(tKick.status, 200, `trial kick: ${tKick.text}`);
+      assert.strictEqual(tKick.json.rconOk, true, 'trial kick accepted over RCON');
+
+      // Denied: everything the role does not grant.
+      assert.strictEqual((await api(trial, 'POST', '/api/admin/raw', { command: 'ListPlayers' })).status, 403, 'raw denied');
+      assert.strictEqual((await api(trial, 'POST', '/api/admin/broadcast', { message: 'hi' })).status, 403, 'broadcast denied');
+      assert.strictEqual((await api(trial, 'GET', '/api/audit')).status, 403, 'audit denied');
+      assert.strictEqual((await api(trial, 'GET', '/api/users')).status, 403, 'users denied');
+      const trialProfile = await api(trial, 'GET', `/api/players/${erikRow.id}`);
+      assert.strictEqual(trialProfile.status, 200);
+      assert.ok(!('ips' in trialProfile.json), 'no ips without the ips perm');
+
+      // No privilege amplification: a 'users'-holder without the rest cannot
+      // hand out roles stronger than their own.
+      step('grant ceiling: users-only holder cannot mint owner invites');
+      const staffRole = await api(owner, 'POST', '/api/roles', {
+        name: 'Staffer', perms: { view: true, stream: true, users: true },
+      });
+      assert.strictEqual(staffRole.status, 200, `staff role: ${staffRole.text}`);
+      await api(owner, 'POST', '/api/users', { username: 'staffer', password: 'staffpass123', roleId: staffRole.json.role.id });
+      const staff = { cookie: null };
+      assert.strictEqual((await api(staff, 'POST', '/api/login', { username: 'staffer', password: 'staffpass123' })).status, 200);
+      const ownerRoleId = (await api(staff, 'GET', '/api/roles')).json.rows.find((r) => r.name === 'owner').id;
+      const escalate = await api(staff, 'POST', '/api/invites', { roleId: ownerRoleId, ttlHours: 24 });
+      assert.strictEqual(escalate.status, 403, `owner invite must be refused: ${escalate.text}`);
+      const escalate2 = await api(staff, 'POST', '/api/users', { username: 'evil', password: 'evilpass1234', role: 'owner' });
+      assert.strictEqual(escalate2.status, 403, 'owner user-create must be refused');
+      const viewerRoleId = (await api(staff, 'GET', '/api/roles')).json.rows.find((r) => r.name === 'viewer').id;
+      const okInvite = await api(staff, 'POST', '/api/invites', { roleId: viewerRoleId, ttlHours: 24 });
+      assert.strictEqual(okInvite.status, 200, `viewer invite within ceiling: ${okInvite.text}`);
+
+      // Editing the role's perms logs members out and cuts their live stream.
+      step('role perms edit revokes member sessions + streams');
+      const tStream = await openStream(app.port, trial.cookie);
+      await tStream.waitFor(/event: hello\n/, 5000, 'trial hello');
+      const tStreamEnded = new Promise((res2) => {
+        tStream.res.once('end', () => res2(true));
+        tStream.res.once('close', () => res2(true));
+      });
+      const upd = await api(owner, 'POST', `/api/roles/${trialRoleId}`, { perms: { view: true, stream: true } });
+      assert.strictEqual(upd.status, 200, `role update: ${upd.text}`);
+      await Promise.race([
+        tStreamEnded,
+        new Promise((_r, rej) => setTimeout(() => rej(new Error('trial stream not cut within 5s of the role edit')), 5000).unref()),
+      ]);
+      tStream.close();
+      assert.strictEqual((await api(trial, 'GET', '/api/me')).status, 401, 'member session revoked by role edit');
+
       // --------------------------------------------------------- (9) SSE kill
       step('SSE stream delivers a live kill event');
       stream = await openStream(app.port, owner.cookie);

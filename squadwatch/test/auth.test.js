@@ -106,7 +106,10 @@ test('session create/get roundtrip (JOIN returns role from users row)', () => {
   assert.ok(s.expiresAt > Date.now() + 29 * 86400 * 1000);
   const got = auth.getSession(s.token);
   assert.ok(got);
-  assert.deepStrictEqual(got.user, { id: u.id, username: 'sess', role: 'viewer' });
+  assert.deepStrictEqual(got.user, {
+    id: u.id, username: 'sess', role: 'viewer', roleId: u.roleId,
+    perms: { view: true, stream: true },
+  });
   assert.strictEqual(auth.getSession('deadbeef'.repeat(8)), null);
   assert.strictEqual(auth.getSession(''), null);
   assert.strictEqual(auth.getSession(null), null);
@@ -177,27 +180,32 @@ test('can() permission matrix spot checks (§12 + §19.3.23)', () => {
   const viewer = { id: 1, role: 'viewer' };
   const admin = { id: 2, role: 'admin' };
   const owner = { id: 3, role: 'owner' };
-  // viewer: read-only; no IPs, no actions, no audit (§19.3.23), no console/users
+  // viewer: read-only; no IPs, no moderation, no audit (§19.3.23), no users
   assert.strictEqual(can(viewer, 'view'), true);
-  assert.strictEqual(can(viewer, 'actions'), false);
-  assert.strictEqual(can(viewer, 'ips'), false);
-  assert.strictEqual(can(viewer, 'audit'), false);
-  assert.strictEqual(can(viewer, 'adminChat'), false);
-  assert.strictEqual(can(viewer, 'raw'), false);
-  assert.strictEqual(can(viewer, 'users'), false);
-  // admin: actions + IPs + audit, but no owner-only surface
+  assert.strictEqual(can(viewer, 'stream'), true);
+  for (const p of ['kick', 'ban', 'warn', 'flags', 'ips', 'audit', 'adminChat', 'raw', 'users']) {
+    assert.strictEqual(can(viewer, p), false, `viewer must not have ${p}`);
+  }
+  // admin: moderation + server control + IPs + audit, but no owner-only surface
   assert.strictEqual(can(admin, 'view'), true);
-  assert.strictEqual(can(admin, 'actions'), true);
-  assert.strictEqual(can(admin, 'ips'), true);
-  assert.strictEqual(can(admin, 'audit'), true);
-  assert.strictEqual(can(admin, 'raw'), false);
-  assert.strictEqual(can(admin, 'users'), false);
-  assert.strictEqual(can(admin, 'slomo'), false);
-  assert.strictEqual(can(admin, 'settings'), false);
-  // owner: everything
-  for (const p of ['view', 'actions', 'ips', 'audit', 'raw', 'console', 'users', 'slomo', 'settings']) {
+  for (const p of ['notes', 'flags', 'warn', 'kick', 'ban', 'broadcast', 'team', 'squad', 'layer', 'match', 'ips', 'audit', 'adminChat']) {
+    assert.strictEqual(can(admin, p), true, `admin should have ${p}`);
+  }
+  for (const p of ['raw', 'users', 'roles', 'slomo', 'settings']) {
+    assert.strictEqual(can(admin, p), false, `admin must not have ${p}`);
+  }
+  // owner: everything in the catalog
+  for (const p of ['view', 'kick', 'ban', 'ips', 'audit', 'raw', 'users', 'roles', 'slomo', 'settings']) {
     assert.strictEqual(can(owner, p), true, `owner should have ${p}`);
   }
+  // custom perms object wins over the role fallback (unknown keys deny)
+  const custom = { id: 4, role: 'Trial Mod', perms: { view: true, kick: true } };
+  assert.strictEqual(can(custom, 'view'), true);
+  assert.strictEqual(can(custom, 'kick'), true);
+  assert.strictEqual(can(custom, 'ban'), false);
+  assert.strictEqual(can(custom, 'raw'), false);
+  assert.strictEqual(can({ id: 5, role: 'owner', perms: { view: true } }, 'raw'), false,
+    'perms object wins even when the role name says owner');
   // unknown perms and bad users are denied
   assert.strictEqual(can(owner, 'nonsense-perm'), false);
   assert.strictEqual(can(null, 'view'), false);

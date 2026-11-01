@@ -11,12 +11,12 @@
  *                             playerPopover, copyBtn, killRow, chatRow, rconToast,
  *                             empty, section, el)
  *   SW.live                   SSE pubsub: on(evt, fn) -> unsub, start(), stop(), up
- *   SW.routes                 hash route name -> { render(el, ctx), cleanup(), role? }
+ *   SW.routes                 hash route name -> { render(el, ctx), cleanup(), perm? }
  *   SW.actions                admin actions (confirm modal + POST + rcon toast)
  *   SW.state                  { me, bootstrap, overview, snapshot, serverInfo, status,
  *                               tickRate, tickHist, layers }
  *   SW.prefs                  localStorage ('sw:' prefix) get/set/del
- *   SW.can(role), SW.navigate(hash), SW.currentRouteName()
+ *   SW.can(perm), SW.canAny(perms), SW.navigate(hash), SW.currentRouteName()
  *
  * CSP: script-src 'self' — NO inline scripts or on*= attributes anywhere.
  * Everything is wired via addEventListener / delegation from this file.
@@ -209,7 +209,7 @@
     if (res.status === 401 && opts.on401 !== 'ignore') {
       SW.state.me = null;
       const name = SW.currentRouteName();
-      if (name !== 'login' && name !== 'setup') {
+      if (name !== 'login' && name !== 'setup' && name !== 'join') {
         SW.live.stop();
         document.body.classList.add('chrome-hidden');
         SW.navigate('#/login');
@@ -461,16 +461,19 @@
         else SW.ui.toast('No stored profile for this player yet', 'warn');
       },
     });
-    if (SW.can('admin') && (ref.dbId || ref.id || ref.steamId || ref.eosId || ref.name)) {
-      items.push('-');
-      items.push({ label: 'Warn', icon: 'warn', onClick: () => SW.actions.warn(ref) });
-      items.push({ label: 'Kick', icon: 'kick', onClick: () => SW.actions.kick(ref) });
-      items.push({ label: 'Ban', icon: 'ban', danger: true, onClick: () => SW.actions.ban(ref) });
-      items.push({ label: 'Force team change', icon: 'swap', onClick: () => SW.actions.forceTeam(ref) });
-      items.push({ label: 'Remove from squad', icon: 'x', onClick: () => SW.actions.removeFromSquad(ref) });
-      items.push('-');
-      items.push({ label: ref.watchlisted ? 'Unwatch' : 'Watch', icon: 'eye', onClick: () => SW.actions.watch(ref, !ref.watchlisted) });
-      items.push({ label: 'Add note', icon: 'note', onClick: () => SW.actions.note(ref) });
+    if (ref.dbId || ref.id || ref.steamId || ref.eosId || ref.name) {
+      /* each action behind its own granular perm (§1) */
+      const mod = [];
+      if (SW.can('warn')) mod.push({ label: 'Warn', icon: 'warn', onClick: () => SW.actions.warn(ref) });
+      if (SW.can('kick')) mod.push({ label: 'Kick', icon: 'kick', onClick: () => SW.actions.kick(ref) });
+      if (SW.can('ban')) mod.push({ label: 'Ban', icon: 'ban', danger: true, onClick: () => SW.actions.ban(ref) });
+      if (SW.can('team')) mod.push({ label: 'Force team change', icon: 'swap', onClick: () => SW.actions.forceTeam(ref) });
+      if (SW.can('squad')) mod.push({ label: 'Remove from squad', icon: 'x', onClick: () => SW.actions.removeFromSquad(ref) });
+      if (mod.length) { items.push('-'); for (const it of mod) items.push(it); }
+      const extra = [];
+      if (SW.can('flags')) extra.push({ label: ref.watchlisted ? 'Unwatch' : 'Watch', icon: 'eye', onClick: () => SW.actions.watch(ref, !ref.watchlisted) });
+      if (SW.can('notes')) extra.push({ label: 'Add note', icon: 'note', onClick: () => SW.actions.note(ref) });
+      if (extra.length) { items.push('-'); for (const it of extra) items.push(it); }
     }
     SW.ui.popover(anchor, items);
   };
@@ -1114,7 +1117,14 @@
   SW.live.on('hello', (d) => {
     if (d && typeof d === 'object') {
       if (d.snapshot) SW.state.snapshot = d.snapshot;
-      if (d.me) SW.state.me = d.me;
+      if (d.me) {
+        const prev = SW.state.me;
+        SW.state.me = d.me;
+        /* a role/perm edit lands on the next SSE connect — rebuild the chrome
+         * (nav + role badge) when it changed, not on every reconnect */
+        if (prev && (prev.role !== d.me.role ||
+          JSON.stringify(prev.perms || null) !== JSON.stringify(d.me.perms || null))) renderShell();
+      }
       updateTopbar();
     }
   });
@@ -1149,7 +1159,7 @@
     }
   });
   SW.live.on('flag', (f) => {
-    if (f && SW.can('admin')) {
+    if (f && SW.can('flags')) {
       const who = (f.player && f.player.name) || 'unknown player';
       SW.ui.toast('Flag S' + (f.severity || '?') + ': ' + (f.type || 'flag') + ' — ' + who, 'warn');
     }
@@ -1161,11 +1171,31 @@
 
   /* ------------------------------------------------------------- router */
 
+  /* Granular permissions (docs/ROLES-INVITES-SETTINGS.md §1): /api/me and the
+   * SSE hello carry me.perms = {permKey: true}; unknown keys deny. Fallbacks:
+   * a bare {role} user maps through the builtin min-role matrix, and a role
+   * name passed as `perm` still works as the legacy rank gate. */
   const ROLE_RANK = { viewer: 1, admin: 2, owner: 3 };
-  SW.can = function can(minRole) {
+  const PERM_MIN_ROLE = {
+    view: 'viewer', stream: 'viewer',
+    notes: 'admin', flags: 'admin', warn: 'admin', kick: 'admin', ban: 'admin',
+    broadcast: 'admin', team: 'admin', squad: 'admin', layer: 'admin', match: 'admin',
+    ips: 'admin', adminChat: 'admin', audit: 'admin',
+    slomo: 'owner', raw: 'owner', users: 'owner', roles: 'owner', settings: 'owner',
+  };
+  SW.can = function can(perm) {
     const me = SW.state.me;
     if (!me) return false;
-    return (ROLE_RANK[me.role] || 0) >= (ROLE_RANK[minRole] || 0);
+    if (ROLE_RANK[perm]) return (ROLE_RANK[me.role] || 0) >= ROLE_RANK[perm]; /* legacy role-string gate */
+    if (me.perms && typeof me.perms === 'object') return me.perms[perm] === true;
+    const min = PERM_MIN_ROLE[perm];
+    if (!min) return false;
+    return (ROLE_RANK[me.role] || 0) >= ROLE_RANK[min];
+  };
+  /* canAny('users') / canAny(['roles', 'users']) — any one key grants access */
+  SW.canAny = function canAny(perms) {
+    if (!Array.isArray(perms)) return SW.can(perms);
+    return perms.some((p) => SW.can(p));
   };
 
   function parseHash() {
@@ -1194,19 +1224,20 @@
     const parsed = parseHash();
     const authed = !!SW.state.me;
     let target = parsed.name || (authed ? 'dashboard' : 'login');
-    if (!authed && target !== 'login' && target !== 'setup') { location.hash = '#/login'; return; }
-    if (authed && (target === 'login' || target === 'setup')) { location.hash = '#/dashboard'; return; }
+    if (!authed && target !== 'login' && target !== 'setup' && target !== 'join') { location.hash = '#/login'; return; }
+    if (authed && (target === 'login' || target === 'setup' || target === 'join')) { location.hash = '#/dashboard'; return; }
     if (currentView && typeof currentView.cleanup === 'function') {
       try { currentView.cleanup(); } catch (e) { console.error('cleanup', e); }
     }
     currentView = null;
     SW.ui.closePopover();
-    document.body.classList.toggle('chrome-hidden', target === 'login' || target === 'setup');
+    document.body.classList.toggle('chrome-hidden', target === 'login' || target === 'setup' || target === 'join');
     document.body.classList.remove('drawer-open');
     main.textContent = '';
     const def = SW.routes[target];
     if (!def) { main.append(SW.ui.empty('Unknown page: ' + target)); return; }
-    if (def.role && !SW.can(def.role)) { main.append(SW.ui.empty('You do not have access to this page', 'lock')); return; }
+    const need = def.perm || def.role; /* perm: key or [keys] (any grants) */
+    if (need && !SW.canAny(need)) { main.append(SW.ui.empty('You do not have access to this page', 'lock')); return; }
     currentView = def;
     updateNavActive(target);
     try {
@@ -1221,6 +1252,8 @@
 
   /* --------------------------------------------------------- shell + nav */
 
+  /* perm: a key or [keys] (any one grants); the Admin separator shows only
+   * when at least one item after it is visible. */
   const NAV = [
     { route: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
     { route: 'live', label: 'Live', icon: 'live' },
@@ -1228,13 +1261,14 @@
     { route: 'matches', label: 'Matches', icon: 'swords' },
     { route: 'chat', label: 'Chat', icon: 'chat' },
     { route: 'trolls', label: 'Trolls', icon: 'shield-alert' },
-    { sep: 'Admin', role: 'admin' },
-    { route: 'admin', label: 'Admin tools', icon: 'gavel', role: 'admin' },
-    { route: 'bans', label: 'Bans', icon: 'ban', role: 'admin' },
-    { route: 'audit', label: 'Audit log', icon: 'scroll', role: 'admin' },
-    { route: 'console', label: 'Console', icon: 'terminal', role: 'owner' },
-    { route: 'users', label: 'Users', icon: 'user-cog', role: 'owner' },
-    { route: 'settings', label: 'Settings', icon: 'settings', role: 'owner' },
+    { sep: 'Admin' },
+    { route: 'admin', label: 'Admin tools', icon: 'gavel', perm: ['broadcast', 'layer', 'match', 'squad', 'team', 'warn', 'kick', 'ban'] },
+    { route: 'bans', label: 'Bans', icon: 'ban', perm: 'ban' },
+    { route: 'audit', label: 'Audit log', icon: 'scroll', perm: 'audit' },
+    { route: 'console', label: 'Console', icon: 'terminal', perm: 'raw' },
+    { route: 'users', label: 'Users', icon: 'user-cog', perm: 'users' },
+    { route: 'roles', label: 'Roles', icon: 'shield', perm: ['roles', 'users'] },
+    { route: 'settings', label: 'Settings', icon: 'settings', perm: 'settings' },
   ];
 
   function updateNavActive(target) {
@@ -1244,7 +1278,8 @@
   }
 
   async function logout() {
-    try { await SW.api('/api/logout', { method: 'POST', toast: false }); } catch (_e) { /* ignore */ }
+    /* body:{} so the POST carries the JSON content-type the server requires */
+    try { await SW.api('/api/logout', { method: 'POST', body: {}, toast: false }); } catch (_e) { /* ignore */ }
     SW.live.stop();
     SW.state.me = null;
     SW.state.overview = null;
@@ -1267,12 +1302,11 @@
     logo.innerHTML = logoSvg(26) + '<span class="logo-word">SQUAD<b>WATCH</b></span>';
     sb.append(logo);
     const nav = el('nav', { class: 'nav' });
+    let pendingSep = null;
     for (const item of NAV) {
-      if (item.sep) {
-        if (!item.role || SW.can(item.role)) nav.append(el('div', { class: 'nav-sep', text: item.sep }));
-        continue;
-      }
-      if (item.role && !SW.can(item.role)) continue;
+      if (item.sep) { pendingSep = item.sep; continue; }
+      if (item.perm && !SW.canAny(item.perm)) continue;
+      if (pendingSep) { nav.append(el('div', { class: 'nav-sep', text: pendingSep })); pendingSep = null; }
       const a = el('a', { class: 'nav-item', href: '#/' + item.route, dataset: { route: item.route }, title: item.label });
       a.innerHTML = SW.icon(item.icon) + '<span class="nav-label"></span>';
       a.querySelector('.nav-label').textContent = item.label;
@@ -1398,7 +1432,7 @@
 
   async function afterLogin() {
     renderShell();
-    SW.live.start();
+    if (SW.can('stream')) SW.live.start(); // the server 403s /api/stream without it
     refreshOverview();
     SW.navigate('#/dashboard');
   }
@@ -1456,10 +1490,9 @@
   };
 
   /* SETUP view — first-run owner creation; setupToken per spec 19.3.15
-   * (printed in the server console; autofilled from bootstrap in --demo mode). */
+   * (printed in the server console at boot — the operator types it in). */
   SW.routes.setup = {
     render(main) {
-      const bs = SW.state.bootstrap || {};
       const card = el('div', { class: 'auth-card card' });
       card.append(logoBlock());
       card.append(el('p', { class: 'auth-note dim', text: 'First run — create the owner account.' }));
@@ -1468,8 +1501,10 @@
       const p1 = el('input', { class: 'input', type: 'password', placeholder: 'Password', autocomplete: 'new-password', required: true, 'aria-label': 'Password' });
       const p2 = el('input', { class: 'input', type: 'password', placeholder: 'Repeat password', autocomplete: 'new-password', required: true, 'aria-label': 'Repeat password' });
       const tok = el('input', { class: 'input mono', type: 'text', placeholder: 'Setup token', autocomplete: 'off', required: true, 'aria-label': 'Setup token' });
-      if (bs.setupToken) tok.value = String(bs.setupToken); /* demo-mode autofill */
       const hint = el('div', { class: 'hint', text: 'The setup token is printed in the server console at boot.' });
+      // Demo mode serves the token via /api/bootstrap (§19.3.15) — prefill it
+      // so trying the demo never requires console access.
+      if (SW.state.bootstrap && SW.state.bootstrap.setupToken) tok.value = SW.state.bootstrap.setupToken;
       const errBox = el('div', { class: 'auth-err hidden' });
       const btn = el('button', { class: 'btn primary wide', type: 'submit', text: 'Create owner account' });
       form.append(u, p1, p2, tok, hint, errBox, btn);
@@ -1510,6 +1545,92 @@
         }
       });
       setTimeout(() => u.focus(), 30);
+    },
+    cleanup() {},
+  };
+
+  /* JOIN view — public invite-claim page at #/join/<token>
+   * (docs/ROLES-INVITES-SETTINGS.md §2). Mirrors setup: whitelisted in
+   * handleRoute/boot, chrome hidden, and POST /api/join sets the session
+   * cookie so success drops straight into the panel like login does. */
+  SW.routes.join = {
+    render(main, ctx) {
+      const token = (ctx.args && ctx.args[0]) || '';
+      const card = el('div', { class: 'auth-card card' });
+      card.append(logoBlock());
+      const box = el('div');
+      card.append(box);
+      main.append(el('div', { class: 'auth-wrap' }, card));
+
+      function deadLink(msg) {
+        box.textContent = '';
+        box.append(el('p', {
+          class: 'auth-note dim',
+          text: msg || 'This invite link is no longer valid — it may have been used, revoked or expired. Ask the person who invited you for a fresh one.',
+        }));
+        box.append(el('div', { class: 'auth-alt' }, el('a', { href: '#/login', text: 'Go to sign in' })));
+      }
+
+      if (!token) { deadLink('This invite link is incomplete — copy the full URL you were sent.'); return; }
+      box.append(el('div', { class: 'auth-note dim', text: 'Checking your invite…' }));
+
+      (async () => {
+        let peek = null;
+        try {
+          peek = await SW.api('/api/join?token=' + encodeURIComponent(token), { toast: false, on401: 'ignore' });
+        } catch (err) {
+          deadLink(err && err.status === 429
+            ? 'Too many attempts from this address — wait a minute, then reload this page.'
+            : 'Could not check this invite — is the panel server reachable?');
+          return;
+        }
+        if (!peek || !peek.valid) { deadLink(); return; }
+        box.textContent = '';
+        const note = el('p', { class: 'auth-note dim' });
+        note.append('You\'ve been invited to ');
+        note.append(el('b', { text: peek.serverName || 'SquadWatch' }));
+        note.append(' as ');
+        note.append(el('b', { text: peek.roleName || 'a member' }));
+        note.append('. Pick a username and password to join.');
+        box.append(note);
+        const form = el('form', { class: 'auth-form' });
+        const u = el('input', { class: 'input', type: 'text', placeholder: 'Username', autocomplete: 'username', required: true, 'aria-label': 'Username' });
+        const p1 = el('input', { class: 'input', type: 'password', placeholder: 'Password', autocomplete: 'new-password', required: true, 'aria-label': 'Password' });
+        const p2 = el('input', { class: 'input', type: 'password', placeholder: 'Repeat password', autocomplete: 'new-password', required: true, 'aria-label': 'Repeat password' });
+        const errBox = el('div', { class: 'auth-err hidden' });
+        const btn = el('button', { class: 'btn primary wide', type: 'submit', text: 'Create account & join' });
+        form.append(u, p1, p2, errBox, btn);
+        box.append(form);
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          errBox.classList.add('hidden');
+          if (p1.value !== p2.value) {
+            errBox.textContent = 'Passwords do not match';
+            errBox.classList.remove('hidden');
+            return;
+          }
+          btn.disabled = true;
+          try {
+            const r = await SW.api('/api/join', {
+              method: 'POST',
+              body: { token, username: u.value.trim(), password: p1.value },
+              toast: false, on401: 'ignore',
+            });
+            SW.state.me = (r && r.user) || null;
+            if (!SW.state.me) throw new Error('Join failed');
+            await afterLogin();
+          } catch (err) {
+            errBox.textContent = err && err.status === 429 ? 'Too many attempts — wait a minute' : ((err && err.message) || 'Join failed');
+            errBox.classList.remove('hidden');
+            card.classList.remove('shake');
+            void card.offsetWidth;
+            card.classList.add('shake');
+          } finally {
+            btn.disabled = false;
+          }
+        });
+        setTimeout(() => u.focus(), 30);
+      })();
     },
     cleanup() {},
   };
@@ -1619,14 +1740,35 @@
       const page = el('div', { class: 'view view-dashboard' });
       main.append(page);
 
+      /* --- "no server linked" banner (settings holders only, dismissable) ---
+       * Unconfigured RCON reports connected:false with lastError:null — a real
+       * outage always carries a lastError, so this only shows when unlinked. */
+      const linkBanner = el('div', { class: 'notice-banner hidden' });
+      linkBanner.append(el('span', { class: 'notice-icon', html: SW.icon('radio') }));
+      linkBanner.append(el('span', { class: 'grow', text: 'No Squad server linked yet — point SquadWatch at your server\'s RCON to bring this dashboard to life.' }));
+      linkBanner.append(el('a', { class: 'btn small primary', href: '#/settings', text: 'Open Settings' }));
+      const linkDismiss = el('button', { type: 'button', class: 'icon-btn', html: SW.icon('x'), 'aria-label': 'Dismiss', title: 'Dismiss' });
+      linkDismiss.addEventListener('click', () => {
+        SW.prefs.set('unlinked-dismissed', true);
+        linkBanner.classList.add('hidden');
+      });
+      linkBanner.append(linkDismiss);
+      page.append(linkBanner);
+      function syncLinkBanner() {
+        if (!SW.can('settings') || SW.prefs.get('unlinked-dismissed', false)) return;
+        const rc = (SW.state.status && SW.state.status.rcon) || null;
+        const unlinked = !!rc && !rc.connected && rc.lastError == null;
+        linkBanner.classList.toggle('hidden', !unlinked);
+      }
+
       /* --- stat cards row --- */
       const cardsRow = el('div', { class: 'stat-row' });
       const cPlayers = SW.ui.statCard({ icon: 'users', label: 'Players', value: '—' });
       const cLayer = SW.ui.statCard({
         icon: 'map', label: 'Current layer', value: '—',
-        onClick: SW.can('admin') ? () => SW.actions.layerDialog() : null,
+        onClick: SW.can('layer') ? () => SW.actions.layerDialog() : null,
       });
-      if (SW.can('admin')) cLayer.title = 'Layer control';
+      if (SW.can('layer')) cLayer.title = 'Layer control';
       const cMatch = SW.ui.statCard({ icon: 'clock', label: 'Match time', value: '--:--' });
       const cFlags = SW.ui.statCard({ icon: 'flag', label: 'Open flags', value: '—', href: '#/trolls' });
       const cBans = SW.ui.statCard({ icon: 'ban', label: 'Active bans', value: '—', href: '#/bans' });
@@ -1693,6 +1835,7 @@
           for (const f of (recent.flags || []).slice(0, 5).reverse()) pushAlert(f);
         }
         syncCards();
+        syncLinkBanner();
         try {
           const pop = await SW.api('/api/pop?hours=24', { toast: false });
           popSamples = (pop && pop.samples) || [];
@@ -1727,6 +1870,7 @@
       unsubs.push(SW.live.on('players', syncCards));
       unsubs.push(SW.live.on('tick', syncCards));
       unsubs.push(SW.live.on('match', syncCards));
+      unsubs.push(SW.live.on('status', syncLinkBanner));
       unsubs.push(SW.live.on('pop', (s) => {
         /* pop event: single sample {time, players, queue, tickRate} or array row */
         if (!s) return;
@@ -1759,40 +1903,46 @@
       const page = el('div', { class: 'view view-live' });
       main.append(page);
 
-      /* admin topline: broadcast quick box + next layer quick set */
-      if (SW.can('admin')) {
+      /* admin topline: broadcast quick box + next layer quick set — each tool
+       * behind its own perm (§1) */
+      if (SW.can('broadcast') || SW.can('layer')) {
         const tools = el('div', { class: 'card live-tools' });
-        const bWrap = el('div', { class: 'tool-group grow' });
-        const bInput = el('input', { class: 'input grow', placeholder: 'Broadcast message to all players…', maxlength: '480', 'aria-label': 'Broadcast message' });
-        const bBtn = el('button', { type: 'button', class: 'btn primary', html: SW.icon('broadcast') + '<span>Send</span>' });
-        const sendB = async () => {
-          const msg = bInput.value.trim();
-          if (!msg) return;
-          bBtn.disabled = true;
-          try { await SW.actions.broadcastSend(msg); bInput.value = ''; } catch (_e) { /* toasted */ }
-          bBtn.disabled = false;
-        };
-        bBtn.addEventListener('click', sendB);
-        bInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendB(); });
-        bWrap.append(bInput, bBtn);
-        const lWrap = el('div', { class: 'tool-group' });
-        const dl = el('datalist', { id: 'layers-dl' });
-        const lInput = el('input', { class: 'input', placeholder: 'Next layer…', list: 'layers-dl', 'aria-label': 'Next layer' });
-        const lBtn = el('button', { type: 'button', class: 'btn', text: 'Set next' });
-        lBtn.addEventListener('click', async () => {
-          const L = lInput.value.trim();
-          if (!L) return;
-          lBtn.disabled = true;
-          try { await SW.actions.setNextLayer(L); lInput.value = ''; } catch (_e) { /* toasted */ }
-          lBtn.disabled = false;
-        });
-        lWrap.append(lInput, dl, lBtn);
-        tools.append(bWrap, lWrap);
+        if (SW.can('broadcast')) {
+          const bWrap = el('div', { class: 'tool-group grow' });
+          const bInput = el('input', { class: 'input grow', placeholder: 'Broadcast message to all players…', maxlength: '480', 'aria-label': 'Broadcast message' });
+          const bBtn = el('button', { type: 'button', class: 'btn primary', html: SW.icon('broadcast') + '<span>Send</span>' });
+          const sendB = async () => {
+            const msg = bInput.value.trim();
+            if (!msg) return;
+            bBtn.disabled = true;
+            try { await SW.actions.broadcastSend(msg); bInput.value = ''; } catch (_e) { /* toasted */ }
+            bBtn.disabled = false;
+          };
+          bBtn.addEventListener('click', sendB);
+          bInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendB(); });
+          bWrap.append(bInput, bBtn);
+          tools.append(bWrap);
+        }
+        if (SW.can('layer')) {
+          const lWrap = el('div', { class: 'tool-group' });
+          const dl = el('datalist', { id: 'layers-dl' });
+          const lInput = el('input', { class: 'input', placeholder: 'Next layer…', list: 'layers-dl', 'aria-label': 'Next layer' });
+          const lBtn = el('button', { type: 'button', class: 'btn', text: 'Set next' });
+          lBtn.addEventListener('click', async () => {
+            const L = lInput.value.trim();
+            if (!L) return;
+            lBtn.disabled = true;
+            try { await SW.actions.setNextLayer(L); lInput.value = ''; } catch (_e) { /* toasted */ }
+            lBtn.disabled = false;
+          });
+          lWrap.append(lInput, dl, lBtn);
+          tools.append(lWrap);
+          SW.actions.fetchLayers().then((layers) => {
+            dl.textContent = '';
+            for (const L of layers) dl.append(el('option', { value: L }));
+          }).catch(() => { /* rcon down */ });
+        }
         page.append(tools);
-        SW.actions.fetchLayers().then((layers) => {
-          dl.textContent = '';
-          for (const L of layers) dl.append(el('option', { value: L }));
-        }).catch(() => { /* rcon down */ });
       }
 
       const rosterWrap = el('div', { class: 'live-grid' });
@@ -1871,7 +2021,7 @@
           row.append(SW.ui.playerLink(d, { class: 'grow' }));
           const since = d.sinceDisconnect || (d.disconnectedAt ? SW.ui.timeAgoText(d.disconnectedAt) : '');
           row.append(el('span', { class: 'dim small mono', text: since }));
-          if (SW.can('admin')) {
+          if (SW.can('ban')) {
             const b = el('button', { type: 'button', class: 'btn danger ghost small', text: 'Ban anyway' });
             b.addEventListener('click', () => SW.actions.ban(d));
             row.append(b);
@@ -1938,14 +2088,14 @@
 
     if (SW.state.me) {
       renderShell();
-      SW.live.start();
+      if (SW.can('stream')) SW.live.start(); // no stream perm -> REST only
       refreshOverview();
       handleRoute();
     } else {
       document.body.classList.add('chrome-hidden');
       const bs = SW.state.bootstrap || {};
-      if (bs.needsSetup && !/^#\/setup/.test(location.hash)) location.hash = '#/setup';
-      else if (!/^#\/(login|setup)/.test(location.hash)) location.hash = '#/login';
+      if (bs.needsSetup && !/^#\/(setup|join)/.test(location.hash)) location.hash = '#/setup';
+      else if (!/^#\/(login|setup|join)/.test(location.hash)) location.hash = '#/login';
       handleRoute();
     }
   }

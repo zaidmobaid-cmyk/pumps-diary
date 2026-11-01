@@ -2,10 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "squadwatch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["squadwatch/server/index.js", "--port", "8790"],
+      "port": 8790
+    },
+    {
       "name": "squadwatch-demo",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["squadwatch/server/index.js", "--demo", "--port", "8790"],
-      "port": 8790
+      "runtimeArgs": ["squadwatch/server/index.js", "--demo", "--port", "8791"],
+      "port": 8791
     }
   ]
 }

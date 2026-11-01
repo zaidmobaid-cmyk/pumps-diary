@@ -456,6 +456,10 @@ enriched bus events (§7). Core rules:
 
 ## 12. Auth — `server/auth.js`
 
+> **Amended**: granular per-role permissions, admin invites, and the runtime settings
+> API are specified in `docs/ROLES-INVITES-SETTINGS.md` (where it and this spec conflict,
+> it wins). Roles are table-backed as of schema v2; the matrix below seeds the builtins.
+
 - `hashPassword(pw)` → `scrypt$N=16384,r=8,p=1$<salt b64>$<hash b64>` via node:crypto
   (`randomBytes(16)` salt, 64-byte key); `verifyPassword` with `timingSafeEqual`.
 - Sessions: token = `randomBytes(32).hex`; store sha256(token); cookie `sw_session`,

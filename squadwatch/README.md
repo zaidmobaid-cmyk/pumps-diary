@@ -22,7 +22,8 @@ alternative you run yourself, with deeper Squad-specific intel:
   verbatim RCON response.
 - **Live view** — current teams, squads and players refreshed continuously, population &
   tick-rate graphs, kill/chat feeds, recently-disconnected list (ban the rage-quitters).
-- **Multi-admin** — owner/admin/viewer roles, per-action permissions, login rate limiting.
+- **Multi-admin** — builtin owner/admin/viewer roles plus custom roles with per-permission
+  grants, one-time invite links for your admin team, login rate limiting.
 
 Zero npm dependencies. One Node process. One SQLite file. No build step.
 
@@ -47,26 +48,32 @@ node server/index.js --demo
 Open http://localhost:8787, create your owner account, and explore with ~40 simulated
 players, live matches, teamkills, a radio griefer, and working admin actions (kicks
 actually remove the fake players). Great for trying the UI before wiring up your server.
+Demo settings are fixed — the panel refuses config changes in `--demo` — so every demo
+run looks the same.
 
 ## Real setup
 
-1. Copy the example config and edit it:
-
-```bash
-cp config.example.json config.json
-```
-
-2. Set `squad.rconHost`, `squad.rconPort`, `squad.rconPassword` (from your server's
-   `Rcon.cfg`), and the `log` section (`mode` + path/credentials).
-
-3. Run it:
+1. Run it:
 
 ```bash
 node server/index.js
 ```
 
-4. Open the panel (default `http://<host>:8787`), create the **owner** account on first
-   run, then add your admins under **Users**.
+2. Open the panel (default `http://<host>:8787`) and create the **owner** account — the
+   first run prints a one-time **setup token** in the console, and the setup form asks
+   for it.
+
+3. Link your Squad server under **Settings → Squad server**: RCON host, port and password
+   (from your host's control panel, or `Rcon.cfg` if you run the box), plus the **Game log
+   source** — a `local` path, or `ftp`/`sftp` (install the one optional dependency it
+   names: `npm install basic-ftp` or `npm install ssh2-sftp-client`). **Test connection**
+   checks both before you save.
+
+4. Add your admins under **Users** — see [Inviting admins](#inviting-admins).
+
+Prefer config files? Edit `config.json` by hand as before (`cp config.example.json
+config.json`) — both routes work, and the panel writes your Settings changes back to
+`config.json` when you save.
 
 Recovery / headless user creation:
 
@@ -80,6 +87,7 @@ See `config.example.json`. Notable options:
 
 | Key | Meaning |
 |---|---|
+| `squad.rconHost` | your server's RCON address; `""` = not linked yet (set it in Settings) |
 | `log.backfill` | `true` = ingest the existing log from the beginning on first run |
 | `log.timezoneOffsetMinutes` | offset if your Squad box's clock isn't UTC |
 | `flags.*` | thresholds for TK-spree / mass-TK / new-player-TK flagging |
@@ -88,6 +96,22 @@ See `config.example.json`. Notable options:
 | `steamApiKey` | optional — fetches Steam avatars/personas for profiles |
 | `discordWebhook` + `webhookEvents` | push flags/bans/kicks to a Discord channel |
 | `retention.chatDays` | prune chat after N days (0 = keep forever) |
+
+## Roles & permissions
+
+Three builtin roles — **owner** (everything, not editable), **admin** and **viewer** —
+plus your own: create a custom role and tick exactly the permissions it should have
+(warn, kick, ban, broadcast, layer control, raw console, see IPs, manage users, …),
+BattleMetrics-style. Editing a role's permissions logs its members out; they sign back
+in with the new permissions, so nobody keeps powers a stale session shouldn't have.
+
+## Inviting admins
+
+**Users → Invite**: pick a role and an expiry, then share the one-time link it generates.
+The invitee opens it, chooses a username and password, and lands straight in the panel
+with that role. Links are single-use, expire, and can be revoked from the Invites table.
+The link points at your panel, so the invitee must be able to reach it — set
+`web.publicUrl` when the panel is hosted behind a real address and the link comes out right.
 
 ## Security notes (read this)
 

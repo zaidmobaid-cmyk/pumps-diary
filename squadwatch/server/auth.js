@@ -115,24 +115,83 @@ function createLoginLimiter({ max = 5, windowMs = 60000, maxEntries = 10000 } = 
 // --------------------------------------------------------- permission matrix
 
 // §12 roles amended by §19.3.23 (audit is admin+; viewer never sees IPs or
-// admin-channel intel). Unknown permissions are denied (secure default).
+// admin-channel intel) and docs/ROLES-INVITES-SETTINGS.md (granular keys +
+// custom roles). Unknown permissions are denied (secure default).
+//
+// PERM_MIN_ROLE serves two jobs: the legacy fallback for bare {role} users,
+// and the seed matrix for the builtin role rows (builtinRolePerms).
 const ROLE_RANK = { viewer: 1, admin: 2, owner: 3 };
 const PERM_MIN_ROLE = {
-  view: 'viewer',    // read-only data + SSE stream
-  stream: 'viewer',
-  actions: 'admin',  // warn/kick/ban/unban/broadcast/layer/match/squads/flags review/notes/manual bans
-  ips: 'admin',      // player IPs + alt detection
-  audit: 'admin',    // §19.3.23: viewer gets 403 on /api/audit
-  adminChat: 'admin',// admin-channel chat + ADMIN_CAM intel
-  raw: 'owner',      // raw RCON console
-  console: 'owner',
-  users: 'owner',
+  view: 'viewer',      // read-only data
+  stream: 'viewer',    // SSE live updates
+  notes: 'admin',      // player notes
+  flags: 'admin',      // flag review, manual flags, watchlist
+  warn: 'admin',
+  kick: 'admin',
+  ban: 'admin',        // ban/unban + bans.cfg export
+  broadcast: 'admin',
+  team: 'admin',       // force team change
+  squad: 'admin',      // disband/remove/demote commander
+  layer: 'admin',      // change/queue layers
+  match: 'admin',      // restart/end match
+  ips: 'admin',        // player IPs + alt detection
+  adminChat: 'admin',  // admin-channel chat + ADMIN_CAM intel
+  audit: 'admin',      // §19.3.23: viewer gets 403 on /api/audit
   slomo: 'owner',
+  raw: 'owner',        // raw RCON console
+  users: 'owner',      // manage panel users + invites
+  roles: 'owner',      // manage roles
   settings: 'owner',
 };
+const PERM_KEYS = Object.keys(PERM_MIN_ROLE);
+
+// Catalog metadata the Roles UI renders (GET /api/perms).
+const PERM_INFO = [
+  { key: 'view', group: 'Panel', label: 'View panel data' },
+  { key: 'stream', group: 'Panel', label: 'Live updates' },
+  { key: 'ips', group: 'Panel', label: 'See IPs & alt accounts' },
+  { key: 'adminChat', group: 'Panel', label: 'See admin chat & admin cam' },
+  { key: 'audit', group: 'Panel', label: 'Read the audit log' },
+  { key: 'notes', group: 'Moderation', label: 'Player notes' },
+  { key: 'flags', group: 'Moderation', label: 'Review flags & watchlist' },
+  { key: 'warn', group: 'Moderation', label: 'Warn players' },
+  { key: 'kick', group: 'Moderation', label: 'Kick players' },
+  { key: 'ban', group: 'Moderation', label: 'Ban / unban players' },
+  { key: 'broadcast', group: 'Server control', label: 'Broadcast messages' },
+  { key: 'team', group: 'Server control', label: 'Force team changes' },
+  { key: 'squad', group: 'Server control', label: 'Manage squads' },
+  { key: 'layer', group: 'Server control', label: 'Change layers' },
+  { key: 'match', group: 'Server control', label: 'Restart / end matches' },
+  { key: 'slomo', group: 'Server control', label: 'Slow motion' },
+  { key: 'raw', group: 'Administration', label: 'Raw RCON console' },
+  { key: 'users', group: 'Administration', label: 'Manage users & invites' },
+  { key: 'roles', group: 'Administration', label: 'Manage roles' },
+  { key: 'settings', group: 'Administration', label: 'Server settings' },
+];
+
+// Only granted keys, no `false` entries: stored perms are always in
+// sanitizePerms' canonical shape, so "same perms" compares equal as JSON and a
+// no-op save on a builtin role never reads as a change (which would log every
+// member out).
+function builtinRolePerms(role) {
+  const out = {};
+  const rank = ROLE_RANK[role] || 0;
+  for (const k of PERM_KEYS) { if (rank >= ROLE_RANK[PERM_MIN_ROLE[k]]) out[k] = true; }
+  return out;
+}
+
+// Drop unknown keys and anything not exactly `true`.
+function sanitizePerms(perms) {
+  const src = perms && typeof perms === 'object' && !Array.isArray(perms) ? perms : {};
+  const out = {};
+  for (const k of PERM_KEYS) { if (src[k] === true) out[k] = true; }
+  return out;
+}
 
 function can(user, perm) {
-  if (!user || !user.role) return false;
+  if (!user) return false;
+  if (user.perms && typeof user.perms === 'object') return user.perms[perm] === true;
+  if (!user.role) return false;
   const min = PERM_MIN_ROLE[perm];
   if (!min) return false;
   return (ROLE_RANK[user.role] || 0) >= ROLE_RANK[min];
@@ -174,6 +233,132 @@ function createAuth({ db, config, bus } = {}) {
 
   function needsSetup() { return userCount() === 0; }
 
+  // ------------------------------------------------------------------- roles
+
+  // Parsed-perms cache: role_id -> { text, obj }. Invalidated by comparing the
+  // stored JSON text, so external writes (tests poking SQL) stay correct.
+  const permsCache = new Map();
+  function parsePerms(roleId, text) {
+    const hit = permsCache.get(roleId);
+    if (hit && hit.text === text) return hit.obj;
+    let obj = {};
+    try { obj = sanitizePerms(JSON.parse(String(text == null ? '{}' : text))); } catch (_e) { obj = {}; }
+    permsCache.set(roleId, { text, obj });
+    return obj;
+  }
+
+  function roleRow(idOrName) {
+    if (idOrName == null) return null;
+    const row = typeof idOrName === 'number' || /^\d+$/.test(String(idOrName))
+      ? stmt('SELECT id, name, builtin, perms, created_at FROM roles WHERE id = ?').get(Number(idOrName))
+      : stmt('SELECT id, name, builtin, perms, created_at FROM roles WHERE name = ?').get(String(idOrName));
+    return row || null;
+  }
+
+  function roleOut(row) {
+    return {
+      id: row.id, name: row.name, builtin: !!row.builtin,
+      perms: parsePerms(row.id, row.perms), createdAt: row.created_at,
+    };
+  }
+
+  function listRoles() {
+    const rows = stmt(
+      `SELECT r.id, r.name, r.builtin, r.perms, r.created_at,
+              (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS members,
+              (SELECT COUNT(*) FROM invites i WHERE i.role_id = r.id AND i.used_at IS NULL
+                      AND i.revoked_at IS NULL AND (i.expires_at IS NULL OR i.expires_at > ?)) AS open_invites
+         FROM roles r ORDER BY r.builtin DESC, r.id`
+    ).all(now());
+    return rows.map((r) => Object.assign(roleOut(r), {
+      members: Number(r.members), openInvites: Number(r.open_invites),
+    }));
+  }
+
+  function validRoleName(name) {
+    const n = String(name == null ? '' : name).trim();
+    if (!n || n.length > 32) throw new Error('role name must be 1-32 characters');
+    if (/^\d+$/.test(n)) throw new Error('role name cannot be all digits'); // ids resolve numerically
+    return n;
+  }
+
+  function createRole(name, perms) {
+    const n = validRoleName(name);
+    const p = sanitizePerms(perms);
+    try {
+      const r = stmt('INSERT INTO roles(name, builtin, perms, created_at) VALUES(?,0,?,?)')
+        .run(n, JSON.stringify(p), now());
+      return roleOut(roleRow(Number(r.lastInsertRowid)));
+    } catch (e) {
+      if (/UNIQUE/i.test(String(e.message))) throw new Error('role name already taken');
+      throw e;
+    }
+  }
+
+  // Returns { role, memberIds } — the API layer revokes members' sessions and
+  // streams (§19.3.18 pattern) when perms changed.
+  function updateRole(id, { name, perms } = {}) {
+    const row = roleRow(Number(id));
+    if (!row) throw new Error('role not found');
+    let newName = row.name;
+    if (name !== undefined && String(name) !== row.name) {
+      if (row.builtin) throw new Error('builtin role names cannot change');
+      newName = validRoleName(name);
+    }
+    let newPerms = row.perms;
+    let permsChanged = false;
+    if (perms !== undefined) {
+      if (row.builtin && row.name === 'owner') throw new Error("the owner role's permissions cannot change");
+      const p = JSON.stringify(sanitizePerms(perms));
+      permsChanged = p !== row.perms;
+      newPerms = p;
+    }
+    try {
+      stmt('UPDATE roles SET name=?, perms=? WHERE id=?').run(newName, newPerms, row.id);
+    } catch (e) {
+      if (/UNIQUE/i.test(String(e.message))) throw new Error('role name already taken');
+      throw e;
+    }
+    const memberIds = permsChanged
+      ? stmt('SELECT id FROM users WHERE role_id = ?').all(row.id).map((u) => Number(u.id))
+      : [];
+    return { role: roleOut(roleRow(row.id)), permsChanged, memberIds };
+  }
+
+  function deleteRole(id) {
+    const row = roleRow(Number(id));
+    if (!row) throw new Error('role not found');
+    if (row.builtin) throw new Error('builtin roles cannot be deleted');
+    const members = stmt('SELECT COUNT(*) AS c FROM users WHERE role_id=?').get(row.id);
+    if (Number(members.c) > 0) throw new Error('role still has members — reassign them first');
+    const open = stmt(
+      `SELECT COUNT(*) AS c FROM invites WHERE role_id=? AND used_at IS NULL AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)`
+    ).get(row.id, now());
+    if (Number(open.c) > 0) throw new Error('role has open invites — revoke them first');
+    stmt('DELETE FROM invites WHERE role_id=? ').run(row.id); // spent/revoked ones
+    stmt('DELETE FROM roles WHERE id=?').run(row.id);
+    permsCache.delete(row.id);
+    return true;
+  }
+
+  // A user "holds the keys" when their role grants users+roles+settings. The
+  // panel must always keep at least one enabled key-holder (generalized
+  // last-owner rule; hUserUpdate enforces it via this helper).
+  function keyholderCount({ exceptUserId } = {}) {
+    const rows = stmt(
+      `SELECT u.id, r.perms, r.id AS role_id FROM users u JOIN roles r ON r.id = u.role_id
+        WHERE u.disabled = 0`
+    ).all();
+    let n = 0;
+    for (const r of rows) {
+      if (exceptUserId != null && Number(r.id) === Number(exceptUserId)) continue;
+      const p = parsePerms(r.role_id, r.perms);
+      if (p.users === true && p.roles === true && p.settings === true) n++;
+    }
+    return n;
+  }
+
   function verifySetupToken(token) {
     if (!setupTokenHex || typeof token !== 'string' || token.length === 0 || token.length > 256) return false;
     const a = crypto.createHash('sha256').update(token).digest();
@@ -181,17 +366,19 @@ function createAuth({ db, config, bus } = {}) {
     return crypto.timingSafeEqual(a, b);
   }
 
+  // role: a roles.id, or a role name ('owner'/'admin'/'viewer'/custom).
   function createUser(username, password, role) {
     const uname = String(username == null ? '' : username).trim();
     if (!uname || uname.length > 64) throw new Error('username must be 1-64 characters');
     if (typeof password !== 'string' || password.length < 1) throw new Error('password required');
     if (password.length > 1024) throw new Error('password too long');
-    if (!ROLES.has(role)) throw new Error("role must be 'owner', 'admin' or 'viewer'");
+    const r = roleRow(role);
+    if (!r) throw new Error('unknown role');
     const t = now();
     try {
-      const r = stmt('INSERT INTO users(username, pass_hash, role, created_at, disabled) VALUES(?,?,?,?,0)')
-        .run(uname, hashPassword(password), role, t);
-      return { id: r.lastInsertRowid, username: uname, role };
+      const ins = stmt('INSERT INTO users(username, pass_hash, role_id, created_at, disabled) VALUES(?,?,?,?,0)')
+        .run(uname, hashPassword(password), r.id, t);
+      return { id: ins.lastInsertRowid, username: uname, role: r.name, roleId: r.id };
     } catch (e) {
       if (/UNIQUE/i.test(String(e.message))) throw new Error('username already taken');
       throw e;
@@ -212,7 +399,10 @@ function createAuth({ db, config, bus } = {}) {
   function verifyLogin(username, password) {
     const uname = String(username == null ? '' : username).trim();
     const row = uname
-      ? stmt('SELECT id, username, role, pass_hash, disabled FROM users WHERE username = ?').get(uname)
+      ? stmt(
+        `SELECT u.id, u.username, u.pass_hash, u.disabled, r.id AS role_id, r.name AS role, r.perms AS perms
+           FROM users u JOIN roles r ON r.id = u.role_id WHERE u.username = ?`
+      ).get(uname)
       : undefined;
     if (!row) {
       verifyPassword(String(password == null ? '' : password), dummyHash()); // timing equalizer
@@ -221,7 +411,7 @@ function createAuth({ db, config, bus } = {}) {
     const ok = verifyPassword(String(password == null ? '' : password), row.pass_hash);
     if (!ok || row.disabled) return null;
     stmt('UPDATE users SET last_login=? WHERE id=?').run(now(), row.id);
-    return { id: row.id, username: row.username, role: row.role };
+    return { id: row.id, username: row.username, role: row.role, roleId: row.role_id, perms: parsePerms(row.role_id, row.perms) };
   }
 
   // ---------------------------------------------------------------- sessions
@@ -239,14 +429,18 @@ function createAuth({ db, config, bus } = {}) {
   }
 
   // §19.3.18: single JOIN resolution; expiry + users.disabled checked in SQL;
-  // role always read from that row. Sliding: refresh when < 15d left.
+  // role + perms always read from that row, so a role edit applies to the very
+  // next request. Sliding: refresh when < 15d left.
   function getSession(token) {
     if (typeof token !== 'string' || token.length < 16 || token.length > 256) return null;
     const t = now();
     const row = stmt(
       `SELECT s.token_hash AS token_hash, s.expires_at AS expires_at,
-              u.id AS id, u.username AS username, u.role AS role
-         FROM auth_sessions s JOIN users u ON u.id = s.user_id
+              u.id AS id, u.username AS username,
+              r.id AS role_id, r.name AS role, r.perms AS perms
+         FROM auth_sessions s
+         JOIN users u ON u.id = s.user_id
+         JOIN roles r ON r.id = u.role_id
         WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled = 0`
     ).get(sha256hex(token), t);
     if (!row) return null;
@@ -257,7 +451,13 @@ function createAuth({ db, config, bus } = {}) {
       stmt('UPDATE auth_sessions SET expires_at=? WHERE token_hash=?').run(expiresAt, row.token_hash);
       refreshed = true;
     }
-    return { user: { id: row.id, username: row.username, role: row.role }, expiresAt, refreshed };
+    return {
+      user: {
+        id: row.id, username: row.username, role: row.role,
+        roleId: row.role_id, perms: parsePerms(row.role_id, row.perms),
+      },
+      expiresAt, refreshed,
+    };
   }
 
   function destroySession(token) {
@@ -267,6 +467,81 @@ function createAuth({ db, config, bus } = {}) {
 
   function destroyUserSessions(userId) {
     return stmt('DELETE FROM auth_sessions WHERE user_id=?').run(userId).changes;
+  }
+
+  // ----------------------------------------------------------------- invites
+
+  // Single-use, role-bound invite links (docs/ROLES-INVITES-SETTINGS.md §2).
+  // Only sha256(token) is stored; the full token is returned exactly once.
+  function createInvite({ roleId, ttlMs, createdBy } = {}) {
+    const r = roleRow(Number(roleId));
+    if (!r) throw new Error('unknown role');
+    const ttl = Number(ttlMs);
+    if (!Number.isFinite(ttl) || ttl < 60000 || ttl > 720 * 3600 * 1000) {
+      throw new Error('invite expiry must be between 1 minute and 30 days');
+    }
+    const token = randomTokenHex(32);
+    const t = now();
+    const ins = stmt(
+      'INSERT INTO invites(token_hash, role_id, created_by, created_at, expires_at) VALUES(?,?,?,?,?)'
+    ).run(sha256hex(token), r.id, createdBy == null ? null : createdBy, t, t + ttl);
+    return { id: Number(ins.lastInsertRowid), token, roleId: r.id, roleName: r.name, expiresAt: t + ttl };
+  }
+
+  function inviteState(row, t) {
+    if (row.revoked_at != null) return 'revoked';
+    if (row.used_at != null) return 'used';
+    if (row.expires_at != null && Number(row.expires_at) <= t) return 'expired';
+    return 'unused';
+  }
+
+  function listInvites() {
+    const t = now();
+    return stmt(
+      `SELECT i.*, r.name AS role_name, c.username AS created_by_name, u.username AS used_by_name
+         FROM invites i
+         JOIN roles r ON r.id = i.role_id
+         LEFT JOIN users c ON c.id = i.created_by
+         LEFT JOIN users u ON u.id = i.used_by
+        ORDER BY i.id DESC`
+    ).all().map((row) => ({
+      id: row.id, roleId: row.role_id, roleName: row.role_name,
+      createdBy: row.created_by, createdByName: row.created_by_name,
+      createdAt: row.created_at, expiresAt: row.expires_at,
+      usedBy: row.used_by, usedByName: row.used_by_name, usedAt: row.used_at,
+      revokedAt: row.revoked_at, state: inviteState(row, t),
+    }));
+  }
+
+  function revokeInvite(id) {
+    const row = stmt('SELECT * FROM invites WHERE id=?').get(Number(id));
+    if (!row) throw new Error('invite not found');
+    if (row.used_at != null) throw new Error('invite was already used');
+    if (row.revoked_at == null) stmt('UPDATE invites SET revoked_at=? WHERE id=?').run(now(), row.id);
+    return true;
+  }
+
+  // Validity probe for the public join page. Returns null for anything not
+  // currently claimable (one generic answer — no state oracle for strangers).
+  function findInvite(token) {
+    if (typeof token !== 'string' || token.length < 16 || token.length > 256) return null;
+    const row = stmt(
+      `SELECT i.*, r.name AS role_name FROM invites i JOIN roles r ON r.id = i.role_id
+        WHERE i.token_hash = ?`
+    ).get(sha256hex(token));
+    if (!row || inviteState(row, now()) !== 'unused') return null;
+    return { id: row.id, roleId: row.role_id, roleName: row.role_name, expiresAt: row.expires_at };
+  }
+
+  // Claim = create the account and consume the invite in one transaction.
+  function claimInvite(token, { username, password } = {}) {
+    return db.tx(() => {
+      const inv = findInvite(token);
+      if (!inv) throw new Error('this invite link is no longer valid');
+      const user = createUser(username, password, inv.roleId);
+      stmt('UPDATE invites SET used_by=?, used_at=? WHERE id=?').run(user.id, now(), inv.id);
+      return { user, inviteId: inv.id };
+    });
   }
 
   // ------------------------------------------------------------------- audit
@@ -313,6 +588,20 @@ function createAuth({ db, config, bus } = {}) {
     getSession,
     destroySession,
     destroyUserSessions,
+    // roles
+    roleRow,
+    parsePerms,
+    listRoles,
+    createRole,
+    updateRole,
+    deleteRole,
+    keyholderCount,
+    // invites
+    createInvite,
+    listInvites,
+    revokeInvite,
+    findInvite,
+    claimInvite,
     // authorization + audit
     can,
     audit,
@@ -328,4 +617,7 @@ function createAuth({ db, config, bus } = {}) {
   };
 }
 
-module.exports = { createAuth, hashPassword, verifyPassword, can, createLoginLimiter, ROLES };
+module.exports = {
+  createAuth, hashPassword, verifyPassword, can, createLoginLimiter, ROLES,
+  PERM_KEYS, PERM_INFO, builtinRolePerms, sanitizePerms,
+};

@@ -1,6 +1,6 @@
 {
   "web": { "port": 8787, "host": "0.0.0.0", "publicUrl": "", "secureCookies": "auto" },
-  "squad": { "rconHost": "127.0.0.1", "rconPort": 21114, "rconPassword": "CHANGEME" },
+  "squad": { "rconHost": "", "rconPort": 21114, "rconPassword": "CHANGEME" },
   "log": {
     "mode": "local",
     "path": "/home/squad/SquadGame/Saved/Logs/SquadGame.log",

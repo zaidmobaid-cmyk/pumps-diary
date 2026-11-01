@@ -167,6 +167,12 @@ class Ingest {
     if (this.retentionTimer) { clearInterval(this.retentionTimer); this.retentionTimer = null; }
   }
 
+  // The watchlist is compiled once in the constructor; the Settings API calls
+  // this after changing flags.chatWatchlist so new patterns apply live.
+  refreshWatchlist() {
+    this.watchlist = compileWatchlist(this.config.flags && this.config.flags.chatWatchlist);
+  }
+
   stop() {
     this.stopTimers();
     if (this.bus) {
