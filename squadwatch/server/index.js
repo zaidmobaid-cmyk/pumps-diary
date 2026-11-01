@@ -288,6 +288,10 @@ async function main() {
   }
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // Windows cannot deliver catchable signals to a child (kill() there is
+  // TerminateProcess), so a parent needing a graceful stop spawns us with an
+  // IPC channel and sends 'shutdown' instead.
+  if (process.send) process.on('message', (m) => { if (m === 'shutdown') shutdown('IPC'); });
 }
 
 main().catch((e) => {

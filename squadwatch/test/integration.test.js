@@ -174,7 +174,9 @@ async function startServer({ tmp, logPath, mock, transcript }) {
 
     const child = spawn(process.execPath, [SERVER_JS, '--config', cfgPath], {
       cwd: ROOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      // 'ipc' so the shutdown step can request a graceful stop on Windows,
+      // where kill() cannot deliver a catchable signal.
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     let buf = '';
     const feed = (c) => {
@@ -451,8 +453,9 @@ test('integration: full boot — MockSquad + real server + HTTP/SSE scenario (SP
       stream = null;
 
       // ------------------------------------------------------- (10) shutdown
-      step('graceful SIGTERM');
-      child.kill('SIGTERM');
+      step('graceful shutdown');
+      if (process.platform === 'win32') child.send('shutdown');
+      else child.kill('SIGTERM');
       const exit = await waitExit(child, 5000);
       assert.strictEqual(exit.code, 0, `clean exit (got code=${exit.code} signal=${exit.signal})`);
       child = null;
