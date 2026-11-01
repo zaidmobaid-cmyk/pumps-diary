@@ -12,6 +12,18 @@ const { MockSquad } = require('../test/mock-squad');
 
 const RCON_PASSWORD = 'demo';
 const GRIEFER = 'GrieferGuy';
+const GRIEFER_TEAM = 2; // RGF side, so his BP_FOBRadio_RUS hits classify as FRIENDLY (§8)
+
+// Stable demo identities: the same name always maps to the same EOS/steam ids,
+// so stats and flags accumulate on one profile across history + live play.
+const crypto = require('node:crypto');
+function identityFor(name) {
+  const h = crypto.createHash('sha256').update('squadwatch-demo:' + name).digest('hex');
+  return {
+    eosId: h.slice(0, 32),
+    steamId: '7656' + String(BigInt('0x' + h.slice(32, 44)) % 10000000000000n).padStart(13, '0'),
+  };
+}
 
 // 4-layer live rotation (all present in MockSquad's ListLayers).
 const ROTATION = ['Yehorivka_RAAS_v1', 'Narva_AAS_v2', 'Gorodok_RAAS_v1', 'Mutaha_AAS_v1'];
@@ -88,9 +100,10 @@ function seedHistory(mock) {
     const roster = [];
     const count = 18 + rnd(9);
     for (let i = 0; i < count; i++) {
-      const teamId = (i % 2) + 1;
+      const teamId = i === 0 ? GRIEFER_TEAM : (i % 2) + 1;
       const name = i === 0 ? GRIEFER : undefined;
-      roster.push(mock.addPlayer({ name, teamId, role: roleFor(mock, teamId) }, t));
+      const ids = name ? identityFor(name) : null;
+      roster.push(mock.addPlayer(Object.assign({ name, teamId, role: roleFor(mock, teamId) }, ids || {}), t));
       t += Math.floor(between(500, 4000));
     }
     // a few squads per team
@@ -133,7 +146,7 @@ function seedHistory(mock) {
     const griefer = roster.find((p) => p.name === GRIEFER) || roster[0];
     for (let h = 0; h < 2; h++) {
       t += 15000;
-      mock.deployableDamage(griefer, 'BP_FOBRadio_Woodland', 350, 'BP_C4_Explosive', { time: t });
+      mock.deployableDamage(griefer, 'BP_FOBRadio_RUS', 350, 'BP_C4_Explosive', { time: t });
     }
 
     t += 60 * 1000;
@@ -189,8 +202,9 @@ function runLiveScenario(mock) {
   const targetPop = 36 + rnd(25);
   let griefer = null;
   const join = (name) => {
-    const teamId = teamNeedingPlayers(mock);
-    return mock.addPlayer({ name, teamId, role: roleFor(mock, teamId) });
+    const teamId = name === GRIEFER ? GRIEFER_TEAM : teamNeedingPlayers(mock);
+    const ids = name ? identityFor(name) : null;
+    return mock.addPlayer(Object.assign({ name, teamId, role: roleFor(mock, teamId) }, ids || {}));
   };
   griefer = join(GRIEFER);
   for (let i = 1; i < targetPop; i++) join();
@@ -246,13 +260,23 @@ function runLiveScenario(mock) {
   // tick rate report every 30-60s
   every(30000, 60000, () => mock.tick(between(30, 50)));
 
+  // One early griefer strike ~60s in, once team factions are known from the
+  // first ShowServerInfo poll, so the FRIENDLY radio classification + sev3 flag
+  // shows up right after boot instead of waiting for the recurring cycle.
+  after(60 * 1000, () => {
+    const g = mock.players.get(griefer.eosId) || (griefer = join(GRIEFER));
+    for (let i = 0; i < 2; i++) {
+      after(i * 4000, () => mock.deployableDamage(g, 'BP_FOBRadio_RUS', 350, 'BP_C4_Explosive'));
+    }
+  });
+
   // GrieferGuy: friendly radio damage + a TK spree roughly every 10 min
   every(8 * 60 * 1000, 12 * 60 * 1000, () => {
     if (!mock.players.has(griefer.eosId)) griefer = join(GRIEFER);
     const g = mock.players.get(griefer.eosId);
     // C4 on his own team's radio, a few charges
     for (let i = 0; i < 2 + rnd(2); i++) {
-      after(i * 4000, () => mock.deployableDamage(g, 'BP_FOBRadio_Woodland', 350, 'BP_C4_Explosive'));
+      after(i * 4000, () => mock.deployableDamage(g, 'BP_FOBRadio_RUS', 350, 'BP_C4_Explosive'));
     }
     // then a TK spree: 3-4 teammates within ~90s
     const mates = mock.onlinePlayers().filter((p) => p.teamId === g.teamId && p.eosId !== g.eosId);

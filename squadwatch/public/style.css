@@ -1314,3 +1314,22 @@ input[type='checkbox'] {
    ========================================================================== */
 .badge.team1 { color: var(--team1); background: rgba(75, 163, 245, 0.09); border-color: rgba(75, 163, 245, 0.45); }
 .badge.team2 { color: var(--team2); background: rgba(229, 116, 75, 0.09); border-color: rgba(229, 116, 75, 0.45); }
+
+/* ============================================================================
+   18. appended by stage 3 (views-admin.js)
+   (broadcast presets, layer rows, expandable rcon toasts)
+   ========================================================================== */
+/* ---- views-admin additions ---- */
+.preset-chip { cursor: pointer; max-width: 100%; }
+.preset-chip .preset-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.preset-chip .preset-del { width: 16px; height: 16px; padding: 0; }
+.preset-chip .preset-del .icon { width: 11px; height: 11px; }
+.layer-item .btn { flex: 0 0 auto; }
+.toast .expand-btn { margin-top: 7px; display: inline-flex; }
+.view-admin .admin-grid .card { margin-top: 0; }
+.view-admin hr { margin: 12px 0; }
