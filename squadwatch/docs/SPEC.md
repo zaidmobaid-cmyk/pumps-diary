@@ -1,5 +1,8 @@
 # SquadWatch — Technical Specification (v1)
 
+> **§19 (Binding amendments) overrides anything earlier in this document that
+> conflicts with it. Read §19 before building any module.**
+
 Self-hosted admin & stats panel for a single Squad dedicated server. A BattleMetrics
 alternative the owner runs themselves: deeper Squad-specific stats (teamkills, damage,
 radio/HAB damage with friendly-fire classification to catch griefers), full chat history,
@@ -200,7 +203,7 @@ Pure functions, no I/O. Exports: `parseLogLine(line)`, `parseChatPacket(body)`,
 ### 6.1 Log line grammar
 Every line: `[YYYY.MM.DD-HH.mm.ss:ms][frame]Category: rest`. `parseLogTime` treats the
 stamp as UTC then applies `timezoneOffsetMinutes` (server clocks vary); returns epoch ms.
-`parseOnlineIds("EOS: 0002a10386d9114496bce8b6ded685871 steam: 76561198012345678")` →
+`parseOnlineIds("EOS: 0002a10386d9114496bce8b6ded68587 steam: 76561198012345678")` →
 `{eosId, steamId}` (either may be missing; keys appear as `EOS:`/`steam:`, order varies —
 scan with `/\b(EOS|steam):\s*([0-9a-f]{32}|\d{17})/gi`).
 
@@ -231,18 +234,18 @@ Attacker "nullptr"/empty controller → environment/suicide (see ingest).
 ### 6.2 Fixture lines (commit EXACTLY these to `test/fixtures/sample.log`, one per line, plus 10+ realistic noise lines that must parse to null)
 
 ```
-[2026.03.01-21.50.52:123][448]LogSquad: PostLogin: NewPlayer: BP_PlayerController_C /Game/Maps/Narva/Gameplay_Layers/Narva_AAS_v2.Narva_AAS_v2:PersistentLevel.BP_PlayerController_C_2147254377 (IP: 86.142.11.23 | Online IDs: EOS: 0002a10386d9114496bce8b6ded685871 steam: 76561198012345678)
+[2026.03.01-21.50.52:123][448]LogSquad: PostLogin: NewPlayer: BP_PlayerController_C /Game/Maps/Narva/Gameplay_Layers/Narva_AAS_v2.Narva_AAS_v2:PersistentLevel.BP_PlayerController_C_2147254377 (IP: 86.142.11.23 | Online IDs: EOS: 0002a10386d9114496bce8b6ded68587 steam: 76561198012345678)
 [2026.03.01-21.51.01:004][512]LogNet: Join succeeded: Wardex
 [2026.03.01-21.55.13:901][771]LogSquad: Player:Wardex ActualDamage=38.250000 from BobTheBuilder (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Player Controller ID: BP_PlayerController_C_2147254111)caused by BP_SVDM_Optic_C
 [2026.03.01-21.55.14:120][772]LogSquadTrace: [DedicatedServer]ASQSoldier::Wound(): Player:Wardex KillingDamage=38.250000 from BP_PlayerController_C_2147254111 (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Controller ID: BP_PlayerController_C_2147254111) caused by BP_SVDM_Optic_C
 [2026.03.01-21.56.20:338][801]LogSquadTrace: [DedicatedServer]ASQSoldier::Die(): Player:Wardex KillingDamage=38.250000 from BP_PlayerController_C_2147254111 (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321 | Controller ID: BP_PlayerController_C_2147254111) caused by BP_SVDM_Optic_C
-[2026.03.01-21.57.05:010][850]LogSquad: BobTheBuilder (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321) has revived Wardex (Online IDs: EOS: 0002a10386d9114496bce8b6ded685871 steam: 76561198012345678).
+[2026.03.01-21.57.05:010][850]LogSquad: BobTheBuilder (Online IDs: EOS: 0002b4c5d6e7f8091a2b3c4d5e6f7081 steam: 76561198087654321) has revived Wardex (Online IDs: EOS: 0002a10386d9114496bce8b6ded68587 steam: 76561198012345678).
 [2026.03.01-21.58.00:555][900]LogSquadTrace: [DedicatedServer]ASQDeployable::TakeDamage(): BP_FOBRadio_Woodland_C_2146067116: 350.000000 damage attempt by causer BP_C4_Explosive_C_2146001122 instigator GrieferGuy with damage type BP_C4_DamageType_C health remaining 1650.000000
 [2026.03.01-22.01.11:000][100]LogWorld: Bringing World /Game/Maps/Yehorivka/Gameplay_Layers/Yehorivka_RAAS_v1.Yehorivka_RAAS_v1 up for play
 [2026.03.01-22.01.30:000][120]LogGameState: Match State Changed from WaitingToStart to InProgress
 [2026.03.01-22.44.10:222][333]LogSquadGameEvents: Display: Team 2, Manticore Security Task Force ( WPMC ) has won the match with 184 Tickets on layer Yehorivka RAAS v1 (level Yehorivka)!
 [2026.03.01-22.45.00:001][950]LogSquad: USQGameState: Server Tick Rate: 38.45
-[2026.03.01-22.46.00:000][960]LogNet: UNetConnection::Close: [UNetConnection] RemoteAddr: 86.142.11.23:50143, Name: EOSIpNetConnection_2147254300, Driver: GameNetDriver EOSNetDriver_2147482519, IsServer: YES, PC: BP_PlayerController_C_2147254377, Owner: BP_PlayerController_C_2147254377, UniqueId: RedpointEOS:0002a10386d9114496bce8b6ded685871
+[2026.03.01-22.46.00:000][960]LogNet: UNetConnection::Close: [UNetConnection] RemoteAddr: 86.142.11.23:50143, Name: EOSIpNetConnection_2147254300, Driver: GameNetDriver EOSNetDriver_2147482519, IsServer: YES, PC: BP_PlayerController_C_2147254377, Owner: BP_PlayerController_C_2147254377, UniqueId: RedpointEOS:0002a10386d9114496bce8b6ded68587
 [2026.03.01-22.47.00:000][970]LogSquad: GoodGuy (Online IDs: EOS: 0002c0ffee00000000000000000000aa steam: 76561198011112222) has created Squad 3 (Squad Name: ARMOR) on Team Manticore Security Task Force
 [2026.03.01-22.48.00:000][980]LogSquad: ADMIN COMMAND: Message broadcasted <Welcome to the server> from RCON
 ```
@@ -704,3 +707,115 @@ Multi-server fleets; RCON unban (impossible — guidance text instead); editing 
 Bans.cfg; auto-punish beyond optional auto-warn; Steam OAuth login; historical seeding
 from old logs (parse-check tool only reports); mobile-native apps; HTTPS termination
 (document reverse proxy / tailscale instead).
+
+## 19. BINDING AMENDMENTS (design-review fixes — these override earlier sections)
+
+### 19.1 Interfaces & shapes
+1. **playerRef (§7)** is `{dbId, eosId, steamId, name, teamId, squadId, sessKills, sessDeaths, sessTks}`
+   (session counters nullable). **state.js (§10)** player records additionally carry
+   `sessKills, sessDeaths, sessTks` (init 0 on connect); state exposes
+   `bumpSession(eosId, {kills?, deaths?, tks?})` and ingest calls it on every enriched
+   kill event (attacker kills++, victim deaths++, tks++ on teamkill). `snapshot()`
+   includes these per player. **snapshot()/SSE payloads NEVER include `ip` or
+   `controller`** — IPs exist only in `GET /api/players/:id` for admin+.
+2. **admin.js (§13)**: `createAdmin({db, rcon, state, auth, config, layersCache}) →
+   {execAdmin(userOrNull, action, params), execRaw(userOrNull, command, auditMeta)}`.
+   System actions (auto-warn, ban enforcement) call `execAdmin(null, …)` → audit row
+   with `user_id` NULL. `createApi` receives this object as `admin`.
+3. **auth.js (§12)**: `createAuth({db, config}) → {hashPassword, verifyPassword,
+   createUser, verifyLogin, createSession, getSession, destroySession,
+   destroyUserSessions, can(user, perm), audit(userId, action, meta), loginLimiter}`.
+   §16 boot uses `auth = createAuth(…)` (no separate `init`).
+4. **createApi deps (§13)** gain `parserHealth: {count24h(), samples()}` (ring buffer of
+   last 10 unmatched lines + 24h counter, built in index.js and fed by the parser wiring).
+5. **Bus (§3)**: add `chat-packet-parsed` (payload = §6.3 parsed packet) to the canonical
+   list. index.js wiring: `rcon.on('chat-packet', b => { const p = parseChatPacket(b);
+   if (p) bus.emit('chat-packet-parsed', p); })`. Ingest consumes `chat-packet-parsed`
+   and emits enriched `chat`.
+6. **revive payload (§7)**: `{time, matchId, reviver: playerRef, revived: playerRef}`;
+   `revive` is also an SSE event (§13 list).
+7. **GET /api/overview counters** gain `tksToday` (COUNT kills WHERE teamkill=1 AND
+   kind='wound' AND time >= start of current UTC day).
+8. **GET /api/trolls**: EVERY leaderboard is `{all:[…], week:[…]}` (teamkills,
+   radioFriendly, tkDeaths, repeatOffenders).
+9. **parseServerInfo** output includes `matchTimeout` (from `MATCHTIMEOUT_d`).
+10. **GET /api/settings** status includes `gameVersion` (from state.serverInfo).
+11. **SQUAD_CREATED chat packet (§6.3)**: same pattern as the log variant WITHOUT the
+    `^LogSquad: ` prefix (body starts `<name> (Online IDs:…) has created Squad …`),
+    same fields.
+12. **NEW_GAME (§6.1)**: `level` = the path segment immediately after `Maps/` (the map
+    folder, e.g. `Yehorivka`); `layerClass` = segment after the final `.`. A later
+    ROUND_ENDED `level` value overwrites `matches.level`.
+
+### 19.2 Schema changes (include in v1 DDL, not a migration)
+13. `bans` gains `steam_id TEXT` (set from the players row or the manual input);
+    `/api/export/bans.cfg` uses `COALESCE(bans.steam_id, players.steam_id)`. Manual ban
+    of a never-seen steamId: create a stub players row `{steam_id, name:'(manual ban)'}`
+    AND store bans.steam_id.
+14. `flags` gains `review_note TEXT` (filled by POST /api/flags/:id/review {note}).
+
+### 19.3 Security (all MUST)
+15. **First-run setup race**: when users==0 at boot, generate
+    `setupToken = randomBytes(16).hex`, print it in the console banner ONLY.
+    `POST /api/setup` requires `{username, password, setupToken}`; compare via sha256 +
+    `timingSafeEqual`; rate-limited like login. `GET /api/bootstrap` may still return
+    `needsSetup`. The frontend Setup view has a token field ("printed in the server
+    console"). In `--demo` mode ONLY, bootstrap returns `setupToken` so the demo is
+    frictionless (demo binds to localhost by default).
+16. **SQL identifier safety**: `sort/dir/filter/channel/reviewed/active/action` query
+    params are resolved through whitelist lookup maps (e.g.
+    `SORT = {last_seen:'last_seen', kills:'kills', teamkills:'teamkills',
+    radio:'radio_damage_friendly', playtime:'play_seconds'}`); unknown key → 400.
+    User strings are NEVER concatenated into SQL — bound params only.
+17. **RCON selector safety** (admin.js): order of preference (a) numeric in-game id →
+    `…ById`; (b) steamId matching `/^7656\d{13}$/` as bare selector (no quotes);
+    (c) a NAME selector is allowed only if it matches `/^[^"\r\n\0]{1,64}$/` — otherwise
+    return `{ok:false, error:'name contains unsafe characters — use the steamId'}`.
+    Values substituted into `autoWarnMessage` have `"` stripped. Validate before exec:
+    ban interval `/^(0|\d{1,3}[mhdwMy])$/`; slomo finite 0.05–10; teamId ∈ {1,2};
+    squadId `/^\d{1,4}$/`; playerId `/^\d{1,6}$/`; changeLayer/setNextLayer argument must
+    EXACTLY equal an entry of the cached ListLayers list (else 400). 400s happen before
+    audit (nothing executed → nothing to audit).
+18. **Sessions**: resolution is a single JOIN (`auth_sessions` × `users`) checking
+    `expires_at > now AND users.disabled = 0`; role always read from that row. Any
+    change to a user's password/role/disabled calls `destroyUserSessions(targetId)`.
+19. **Proxy model**: config gains `web.trustProxy` (default `false`).
+    `clientIp(req)` = trustProxy ? last X-Forwarded-For hop : `socket.remoteAddress`.
+    `x-forwarded-proto` honored only when trustProxy. Login limiter + stored IPs +
+    audit IPs key on `clientIp()`. Limiter map capped at 10k entries, swept per minute.
+20. **CSRF exact algorithm** (mutating routes): take `Origin`, else `Referer`;
+    absent → 403; literal `null` → 403; `new URL(v).host` must strictly equal
+    `req.headers.host` OR the host of `web.publicUrl`. Mutating requests must have
+    `Content-Type: application/json`.
+21. **Pagination clamps** (one helper): `per = clamp(1..200)`, `page >= 0`,
+    `hours <= 720`. Every "[all]" list in §13 becomes `LIMIT 2000` + `total` count and
+    a `truncated` boolean.
+22. **SSE limits**: api.js attaches ONE bus listener per event type, fanning out to a
+    `Set` of client responses. Max 4 concurrent streams per user, 64 global (503 beyond).
+    Heartbeat comment `: ping` every 25s; drop clients on write error/backpressure.
+    Viewer-role streams do NOT receive admin-channel chat or ADMIN_CAM events.
+23. **Viewer intel**: admin-channel chat (`channel='admin'`) and ADMIN_CAM data are
+    excluded from every viewer-facing read (SQL WHERE + SSE). `/api/audit` is admin+
+    only (viewer gets 403). §12 matrix updated accordingly.
+24. **Input caps at ingest**: chat message stored max 480 chars; player name max 64;
+    logsource carry buffer max 64 KiB (overflow → discard fragment, count as unparsed,
+    resync at next newline).
+25. **XSS sinks**: console output, audit `rcon_command`/`rcon_response`, unmatched-line
+    samples, flag details, toast bodies are rendered via `textContent` / `<pre>` nodes
+    ONLY. api.js sets on every response: `X-Content-Type-Options: nosniff`,
+    `Referrer-Policy: no-referrer`, and on HTML:
+    `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'
+    'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;
+    img-src 'self' https: data:; connect-src 'self'; frame-ancestors 'none'`.
+    **Consequence for the frontend: NO inline `<script>`, NO `onclick=`/`on*=`
+    attributes anywhere — external .js files and `addEventListener`/delegation only.**
+26. **Static serving**: decodeURIComponent once (400 on throw); reject `\0` and any
+    `..` segment BEFORE resolve; final check `resolved === pub || resolved.startsWith(pub + path.sep)`;
+    whitelist extensions `.html .css .js .svg .png .ico .webmanifest .map .woff2` with an
+    explicit MIME table.
+27. **Secret redaction**: `REDACT_PATHS = ['squad.rconPassword','log.ftp.password',
+    'log.sftp.password','steamApiKey','discordWebhook']` → `'•••'` in /api/settings;
+    the same scrub applies to logged error strings/status objects; never log the merged
+    config. config.js logs a prominent warning when `log.mode==='ftp' && !log.ftp.secure`.
+28. **ListPlayers `ID:`** values are the numeric in-game player ids used by `…ById`
+    commands — state keeps them current; they change per connection.
