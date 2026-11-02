@@ -34,6 +34,17 @@ async function boot(t, publicDir, staticSnapshot) {
   get.raw = (p) => new Promise((resolve, reject) => {
     http.get({ host: '127.0.0.1', port: server.address().port, path: p }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject);
   });
+  // The first frame of a fresh live stream: {snapshot, me, build}.
+  get.hello = async () => {
+    const u = auth.createUser(`watcher${Math.random().toString(36).slice(2, 8)}`, 'password-123', 'viewer');
+    const ac = new AbortController();
+    const res = await fetch(base + '/api/stream', { headers: { cookie: `sw_session=${auth.createSession(u.id, {}).token}` }, signal: ac.signal });
+    const reader = res.body.getReader();
+    let text = '';
+    while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value);
+    ac.abort();
+    return JSON.parse(/^data: (.*)$/m.exec(text)[1]);
+  };
   return get;
 }
 
@@ -43,7 +54,7 @@ function makePublic(t) {
   fs.writeFileSync(path.join(root, 'secret.js'), 'outside public/');
   const dir = path.join(root, 'public');
   fs.mkdirSync(path.join(dir, 'css'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'index.html'), '<link href="css/a.css"><script src="app.js"></script><script src="missing.js"></script>');
+  fs.writeFileSync(path.join(dir, 'index.html'), '<head><link href="css/a.css"></head><script src="app.js"></script><script src="missing.js"></script>');
   fs.writeFileSync(path.join(dir, 'app.js'), 'console.log("v1")');
   fs.writeFileSync(path.join(dir, 'css', 'a.css'), 'body{}');
   fs.writeFileSync(path.join(dir, 'notes.txt'), 'not servable');
@@ -61,6 +72,11 @@ test('snapshot: boot-time files and content-hash stamps; later edits stay out', 
   assert.ok(index.text.includes(`src="app.js?v=${hash10('console.log("v1")')}"`), index.text);
   assert.ok(index.text.includes(`href="css/a.css?v=${hash10('body{}')}"`), index.text);
   assert.ok(index.text.includes('src="missing.js"'), 'unknown assets stay unstamped');
+  // One build id for the snapshot, in the page and in every stream hello:
+  // a tab left open across a restart sees a hello naming another build.
+  const build = /<meta name="a3-build" content="([0-9a-f]{10})">/.exec(index.text);
+  assert.ok(build, 'the page carries its build id');
+  assert.strictEqual((await get.hello()).build, build[1], 'the stream hello names the same build');
 
   fs.writeFileSync(path.join(dir, 'app.js'), 'console.log("v2 half-written');
   fs.writeFileSync(path.join(dir, 'late.js'), 'added after boot');
@@ -84,5 +100,17 @@ test('no snapshot: reads the disk on every request, mtime stamps', async (t) => 
   fs.writeFileSync(path.join(dir, 'app.js'), 'console.log("v2")');
   assert.strictEqual((await get('/app.js')).text, 'console.log("v2")');
   const mt = Math.floor(fs.statSync(path.join(dir, 'app.js')).mtimeMs).toString(36);
-  assert.ok((await get('/')).text.includes(`src="app.js?v=${mt}"`));
+  const page = (await get('/')).text;
+  assert.ok(page.includes(`src="app.js?v=${mt}"`));
+  assert.ok(!page.includes('a3-build'), 'no build id while files are read live');
+  assert.strictEqual((await get.hello()).build, null);
+});
+
+test('a restart with changed files is a new build; unchanged files keep the id', async (t) => {
+  const dir = makePublic(t);
+  const idOf = async () => /content="([0-9a-f]{10})"/.exec((await (await boot(t, dir, true))('/')).text)[1];
+  const first = await idOf();
+  assert.strictEqual(await idOf(), first, 'same files, same build');
+  fs.writeFileSync(path.join(dir, 'css', 'a.css'), 'body{color:red}');
+  assert.notStrictEqual(await idOf(), first, 'any changed file makes a new build');
 });

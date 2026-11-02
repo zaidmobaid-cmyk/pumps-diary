@@ -3022,6 +3022,9 @@
     'destruction', 'training', 'tanks', 'trackattack', 'track']);
   /* one RCON faction or unit-type token (NEXT-CONTRACTS §1) */
   const LP_PART_RE = /^[A-Za-z0-9_]{1,48}$/;
+  /* one team as typed in a pasted line: "SU_IDF+Combined", "SU_PALINS", or
+   * "SU_IDF+" while the unit type is still being typed */
+  const LP_TEAM_TOKEN_RE = /^[A-Za-z0-9_]{1,48}(\+[A-Za-z0-9_]{0,48})?$/;
   /* the built-in vanilla codes and unit types (§1) — suggestions keep
    * working while GET /api/factions is unreachable */
   const VANILLA_FACTIONS = ['ADF', 'BAF', 'CAF', 'IMF', 'INS', 'MEA', 'PLA', 'PLAAGF', 'PLANMC', 'RGF',
@@ -3313,7 +3316,7 @@
 
       /* ---- browse: search, vanilla/modded filter, grouped listbox */
       const search = el('input', {
-        class: 'input', type: 'search', placeholder: 'Search map, mode or mod…', autocomplete: 'off',
+        class: 'input', type: 'search', placeholder: 'Search, or paste "Layer Team1 Team2"…', autocomplete: 'off',
         spellcheck: 'false', 'aria-label': 'Search layers', 'aria-controls': uid + '-list',
       });
       const sbox = el('div', { class: 'search-box lp-search' });
@@ -3696,9 +3699,35 @@
         step(d);
         return true;
       }
+      /* a whole command line in the search box — "SU_Sumari_Seed_v1
+       * SU_IDF+Combined SU_PALINS", maybe led by AdminChangeLayer or
+       * AdminSetNextLayer, the layer also with spaces — names an exact layer
+       * and up to two teams. -> {L, teams} | null */
+      function lineOf(raw) {
+        if (!catalog || !catalog.length) return null;
+        const toks = String(raw).trim().split(/\s+/).filter(Boolean);
+        if (toks.length && /^admin(change|setnext)layer$/i.test(toks[0])) toks.shift();
+        for (let k = toks.length; k >= 1; k--) {
+          const key = lpNorm(toks.slice(0, k).join(' '));
+          const L = catalog.find((x) => x.key === key);
+          if (!L) continue;
+          const teams = toks.slice(k);
+          if (teams.length > 2 || !teams.every((t) => LP_TEAM_TOKEN_RE.test(t))) return null;
+          return { L, teams };
+        }
+        return null;
+      }
       search.addEventListener('input', () => {
         if (qTimer) clearTimeout(qTimer);
-        qTimer = setTimeout(() => { qTimer = null; query = search.value; drawList(true); }, 70);
+        qTimer = setTimeout(() => {
+          qTimer = null;
+          const line = lineOf(search.value);
+          query = line ? line.L.name : search.value;
+          drawList(true);
+          if (!line) return;
+          select(line.L, true);
+          if (line.teams.length) setTeams(line.teams[0], line.teams[1] || '');
+        }, 70);
       });
       search.addEventListener('keydown', (e) => {
         if (navKey(e)) return;
@@ -3941,6 +3970,25 @@
     };
     return live;
   })();
+
+  /* the build this page came from (a live server stamps it into index.html);
+   * a stream hello naming another build means the panel was updated under
+   * this tab, which keeps running the old code until it reloads */
+  const PAGE_BUILD = (() => {
+    const meta = document.querySelector('meta[name="a3-build"]');
+    return meta ? meta.getAttribute('content') : null;
+  })();
+  let updateToast = null;
+  SW.live.on('hello', (d) => {
+    const build = d && d.build;
+    if (!build || !PAGE_BUILD || build === PAGE_BUILD || updateToast) return;
+    updateToast = SW.ui.toast('A3 Admin was updated', 'info', {
+      icon: 'refresh',
+      detail: 'This tab still runs the old version. Reload to get the new one.',
+      sticky: true,
+      actions: [{ label: 'Reload now', primary: true, onClick: () => window.location.reload() }],
+    });
+  });
 
   /* after a recovered outage: refetch overview/status, then tell the views */
   let resyncBusy = false;

@@ -154,6 +154,13 @@ function createApi(deps) {
   // reach browsers only on restart, together with the server code they are
   // written against. Without the option every request reads the disk.
   const staticFiles = deps && deps.staticSnapshot === true ? snapshotStatic(pubDir) : null;
+  // One id for the whole snapshot: stamped into the page and sent in every
+  // stream hello, so a tab opened before a restart learns it is outdated.
+  const buildId = staticFiles
+    ? crypto.createHash('sha256')
+      .update([...staticFiles.entries()].map(([p, f]) => path.relative(pubDir, p) + ':' + f.tag).sort().join('\n'))
+      .digest('hex').slice(0, 10)
+    : null;
   const ph = parserHealth && typeof parserHealth.count24h === 'function'
     ? parserHealth : { count24h: () => 0, samples: () => [] };
   const AUDIT_ACTIONS = new Set([
@@ -606,7 +613,7 @@ function createApi(deps) {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
-    res.write(`event: hello\ndata: ${JSON.stringify({ snapshot: snapshot(), me: ctx.user })}\n\n`);
+    res.write(`event: hello\ndata: ${JSON.stringify({ snapshot: snapshot(), me: ctx.user, build: buildId })}\n\n`);
     const client = { res, user: ctx.user };
     sse.clients.add(client);
     sse.perUser.set(uid, cur + 1);
@@ -2143,7 +2150,8 @@ function createApi(deps) {
           } catch (_e) { return m; }
         }
       );
-      buf = Buffer.from(html, 'utf8');
+      const meta = buildId ? `<meta name="a3-build" content="${buildId}">\n` : '';
+      buf = Buffer.from(!meta ? html : (html.includes('</head>') ? html.replace('</head>', meta + '</head>') : meta + html), 'utf8');
     }
     res.setHeader('Content-Type', mime);
     res.setHeader('Cache-Control', 'no-cache');

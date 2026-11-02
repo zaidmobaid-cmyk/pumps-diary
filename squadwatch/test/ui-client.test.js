@@ -98,7 +98,7 @@ function makeDocument() {
   const doc = { readyState: 'loading', title: 'A3 Admin', activeElement: null, listeners: [] };
   class FakeNode {
     constructor(tag) {
-      this.nodeType = tag === '#text' ? 3 : 1;
+      this.nodeType = tag === '#text' ? 3 : (tag === '#fragment' ? 11 : 1);
       this.tagName = tag === '#text' ? '#text' : String(tag).toUpperCase();
       this.childNodes = [];
       this.parentNode = null;
@@ -159,6 +159,7 @@ function makeDocument() {
     }
     insertAdjacentHTML(_where, h) { this.html += h; }
     appendChild(c) {
+      if (c.nodeType === 11) { for (const k of c.childNodes.slice()) this.appendChild(k); return c; }
       if (c.parentNode) c.remove();
       c.parentNode = this;
       this.childNodes.push(c);
@@ -213,6 +214,7 @@ function makeDocument() {
   }
   doc.createElement = (t) => new FakeNode(t);
   doc.createTextNode = (s) => { const n = new FakeNode('#text'); n.data = String(s); return n; };
+  doc.createDocumentFragment = () => new FakeNode('#fragment');
   doc.addEventListener = (t, fn) => { doc.listeners.push([t, fn]); };
   doc.removeEventListener = (t, fn) => { doc.listeners = doc.listeners.filter(([a, b]) => a !== t || b !== fn); };
   doc.documentElement = new FakeNode('html');
@@ -266,6 +268,13 @@ function loadApp(routes, opts) {
     getElementById: () => null,
     createElement() { throw new Error('this test renders nothing'); },
   };
+  if (opts.build) {
+    /* the build stamp a live server writes into index.html */
+    const meta = document.createElement('meta');
+    meta.setAttribute('name', 'a3-build');
+    meta.setAttribute('content', opts.build);
+    document.documentElement.appendChild(meta);
+  }
   const xhrs = [];
   const fetched = [];
   const winListeners = [];
@@ -911,4 +920,64 @@ test('mute toggles share one page-wide listener, so a left page is not kept aliv
   a.SW.sound.setMuted(false);
   assert.strictEqual(toggle.getAttribute('aria-pressed'), 'false');
   dash.cleanup();
+});
+
+test('a tab left open across an update offers one reload; the same build stays quiet', () => {
+  const a = loadApp({}, { dom: true, build: 'aaaaaaaaaa' });
+  const toasts = captureToasts(a);
+  a.SW.live.emit('hello', { me: null, build: 'aaaaaaaaaa' });
+  assert.strictEqual(toasts.length, 0, 'same build: nothing to say');
+  a.SW.live.emit('hello', { me: null, build: 'bbbbbbbbbb' });
+  assert.strictEqual(toasts.length, 1);
+  assert.strictEqual(toasts[0].msg, 'A3 Admin was updated');
+  assert.strictEqual(toasts[0].opts.sticky, true, 'it waits for the admin');
+  assert.deepStrictEqual(Array.from(toasts[0].opts.actions, (x) => x.label), ['Reload now']);
+  a.SW.live.emit('hello', { me: null, build: 'cccccccccc' });
+  assert.strictEqual(toasts.length, 1, 'shown once, not on every reconnect');
+
+  const dev = loadApp({}, { dom: true });
+  const devToasts = captureToasts(dev);
+  dev.SW.live.emit('hello', { me: null, build: 'bbbbbbbbbb' });
+  assert.strictEqual(devToasts.length, 0, 'a page without a build stamp (demo) never asks');
+});
+
+test('layer picker: a whole command line pasted into the search picks the layer and both teams', async () => {
+  const a = loadApp({
+    '/api/layers': [200, { layers: ['SU_Sumari_Seed_v1', 'SU_Fallujah_Invasion_v2', 'Narva_AAS_v2'] }],
+    '/api/factions': [200, { known: [{ code: 'SU_IDF', mod: true }, { code: 'SU_PALINS', mod: true }], types: ['Combined'], combos: {} }],
+  }, { dom: true });
+  a.SW.state.me = { id: 1, username: 'nailed', role: 'owner', perms: { layer: true } };
+  a.SW.ui.openLayerPicker();
+  await flush(20);
+  const modal = a.document.querySelector('.lp-modal');
+  const search = modal.querySelector('.lp-search input');
+  const paste = async (v) => {
+    search.value = v;
+    search.dispatchEvent(new FakeEvent('input'));
+    await new Promise((r) => setTimeout(r, 120));
+  };
+  const state = () => ({
+    sel: (modal.querySelector('.lp-sel-name') || {}).textContent || null,
+    teams: Array.from(modal.querySelectorAll('.lp-team'), (t) => Array.from(t.querySelectorAll('input'), (i) => i.value).join('|')),
+    listed: Array.from(modal.querySelectorAll('.lp-opt-name'), (n) => n.textContent),
+  });
+
+  await paste('umari_Seed_v1 SU_IDF+Combined SU_PALINS');
+  assert.strictEqual(state().sel, null, 'a cut-off layer name is just a search, nothing is picked');
+
+  await paste('SU_Sumari_Seed_v1 SU_IDF+Combined SU_PALINS');
+  assert.deepStrictEqual(state(), {
+    sel: 'SU_Sumari_Seed_v1', teams: ['SU_IDF|Combined', 'SU_PALINS|'], listed: ['SU_Sumari_Seed_v1'],
+  }, 'the exact line the owner typed');
+
+  await paste('AdminSetNextLayer Narva_AAS_v2 RGF+CombinedArms USA+Armored');
+  assert.deepStrictEqual(state().teams, ['RGF|CombinedArms', 'USA|Armored'], 'a leading command word is skipped');
+  assert.strictEqual(state().sel, 'Narva_AAS_v2');
+
+  await paste('SU Fallujah Invasion v2');
+  assert.strictEqual(state().sel, 'SU_Fallujah_Invasion_v2', 'a layer typed with spaces');
+  assert.deepStrictEqual(state().teams, ['RGF|CombinedArms', 'USA|Armored'], 'a bare layer keeps the teams already set');
+
+  await paste('fallujah');
+  assert.deepStrictEqual(state().listed, ['SU_Fallujah_Invasion_v2'], 'plain words still search');
 });
