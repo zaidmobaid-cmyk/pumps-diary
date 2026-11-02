@@ -174,11 +174,15 @@ async function main() {
     }
   });
   rcon.on('connected', () => { bus.emit('rcon-status'); kickPolls(true); });
-  rcon.on('disconnected', () => bus.emit('rcon-status'));
+  rcon.on('disconnected', () => {
+    state.noteRconDown(); // next ListSquads is a baseline, not disband evidence
+    bus.emit('rcon-status');
+  });
   rcon.on('error', (e) => log.error('rcon', e && e.message ? e.message : String(e)));
 
   // state -> bus bridge (api + ingest listen on the bus)
   state.on('serverinfo-updated', (info) => bus.emit('serverinfo-updated', info));
+  state.on('squad-disbanded', (ev) => bus.emit('squad-disbanded', ev));
 
   // ------------------------------------------------------- admin + ingest
   const admin = createAdmin({ db, rcon, state, auth, config: cfg, layersCache: () => state.layers });

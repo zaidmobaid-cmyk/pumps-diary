@@ -341,6 +341,36 @@ test('integration: full boot — MockSquad + real server + HTTP/SSE scenario (SP
       assert.strictEqual(aliceRow.kills, 1, 'enemy wound counted as a kill');
       assert.strictEqual(aliceRow.teamkills, 0, 'enemy wound is not a TK');
 
+      // ----------------- (6b) squad lifecycle: creation times + disband
+      // (inside match 1 — squads dissolve with the map change later on)
+      step('squad creation times in the snapshot + unified live feed');
+      const snapNow = (await api(owner, 'GET', '/api/overview')).json.snapshot;
+      const t1 = (snapNow.teams || []).find((t) => t.teamId === 1) || { squads: [] };
+      const alpha = t1.squads.find((s) => s.name === 'ALPHA');
+      assert.ok(alpha, 'ALPHA squad visible in the snapshot');
+      assert.ok(Number.isFinite(alpha.createdAt), 'ALPHA carries an exact createdAt');
+      assert.strictEqual(alpha.creatorName, 'Alice', 'ALPHA creator recorded');
+
+      const feed = (await api(owner, 'GET', '/api/live/feed?limit=200')).json;
+      const alphaCreated = feed.rows.filter((r) => r.kind === 'squad' && r.data.type === 'created' && r.data.name === 'ALPHA');
+      assert.strictEqual(alphaCreated.length, 1, `log+packet dedupe: one ALPHA creation event, got ${alphaCreated.length}`);
+      assert.ok(feed.rows.some((r) => r.kind === 'kill'), 'feed carries kills');
+      assert.ok(feed.rows.some((r) => r.kind === 'chat'), 'feed carries chat');
+      assert.ok(feed.rows.some((r) => r.kind === 'connect'), 'feed carries joins');
+
+      step('disband squad records the acting admin');
+      const disband = await api(owner, 'POST', '/api/admin/disbandSquad', { teamId: alpha.teamId, squadId: alpha.squadId });
+      assert.strictEqual(disband.status, 200, `disband: ${disband.text}`);
+      assert.strictEqual(disband.json.rconOk, true, `disband rcon: ${disband.json.rconResponse}`);
+      const feedAfterDisband = (await api(owner, 'GET', '/api/live/feed?limit=200')).json;
+      const disbandedRow = feedAfterDisband.rows.find((r) => r.kind === 'squad' && r.data.type === 'disbanded' && r.data.name === 'ALPHA');
+      assert.ok(disbandedRow, 'disband recorded in the feed');
+      assert.strictEqual(disbandedRow.data.byUser, 'boss', 'disband attributed to the acting admin');
+      const snapAfterDisband = (await api(owner, 'GET', '/api/overview')).json.snapshot;
+      const t1After = (snapAfterDisband.teams || []).find((t) => t.teamId === 1) || { squads: [] };
+      assert.ok(!t1After.squads.some((s) => s.squadId === alpha.squadId && s.name === 'ALPHA'),
+        'ALPHA gone from the live snapshot immediately after disband');
+
       const borisProfile = await api(owner, 'GET', `/api/players/${borisRow.id}`);
       assert.strictEqual(borisProfile.status, 200);
       assert.strictEqual(borisProfile.json.player.teamkills, 1);

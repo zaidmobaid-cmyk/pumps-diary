@@ -1046,13 +1046,13 @@
   /* ------------------------------------------------------------- SSE live
    * SW.live.on(evt, fn) -> unsubscribe fn. Events (spec §13 + §19.6):
    * hello, kill, chat, deployable, flag, connect, disconnect, players, match,
-   * serverinfo, tick, status, broadcast, pop, revive. Internal: '_conn' {up}.
+   * serverinfo, tick, status, broadcast, pop, revive, squad. Internal: '_conn' {up}.
    * '*' subscribes to everything as fn(evt, data).
    */
   SW.live = (function () {
     const subs = new Map();
     const EVENTS = ['hello', 'kill', 'chat', 'deployable', 'flag', 'connect', 'disconnect',
-      'players', 'match', 'serverinfo', 'tick', 'status', 'broadcast', 'pop', 'revive'];
+      'players', 'match', 'serverinfo', 'tick', 'status', 'broadcast', 'pop', 'revive', 'squad'];
     let es = null;
     let retryTimer = null;
     let backoff = 1000;

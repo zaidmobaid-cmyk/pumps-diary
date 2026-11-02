@@ -121,6 +121,25 @@ CREATE TABLE invites(
   revoked_at INTEGER);
 `;
 
+// v3 — squad lifecycle history: who created each squad and exactly when
+// (vehicle-claim adjudication), and who disbanded what. Fed by the
+// SQUAD_CREATED log/chat-packet events and by poll-diff disband detection.
+const DDL_V3 = `
+CREATE TABLE squad_events(
+  id INTEGER PRIMARY KEY,
+  time INTEGER,
+  match_id INTEGER,
+  type TEXT,
+  team_id INTEGER,
+  squad_id INTEGER,
+  name TEXT,
+  player_id INTEGER,
+  player_name TEXT,
+  by_user INTEGER);
+CREATE INDEX idx_squad_events_match ON squad_events(match_id);
+CREATE INDEX idx_squad_events_time ON squad_events(time);
+`;
+
 const USERS_V2_REBUILD = `
 CREATE TABLE users_v2(
   id INTEGER PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE,
@@ -237,6 +256,24 @@ function openDb(dbPath) {
       });
       version = 2;
       log.info('db', 'migrated schema to v2 (roles, invites)');
+    }
+    if (version < 3) {
+      tx(() => {
+        exec(DDL_V3);
+        prepare('UPDATE schema_version SET version=?').run(3);
+      });
+      version = 3;
+      log.info('db', 'migrated schema to v3 (squad_events)');
+    }
+    if (version < 4) {
+      tx(() => {
+        // The live-feed backfill reads recent DISCONNECTS, but sessions rows
+        // are ordered by connect: disconnect_at needs its own index.
+        exec('CREATE INDEX idx_sessions_disconnect ON sessions(disconnect_at);');
+        prepare('UPDATE schema_version SET version=?').run(4);
+      });
+      version = 4;
+      log.info('db', 'migrated schema to v4 (sessions disconnect index)');
     }
     return version;
   }

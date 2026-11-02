@@ -55,6 +55,24 @@ class LiveState extends EventEmitter {
     this.controllers = new Map();
     /** parsed ListSquads rows (§6.4) */
     this.squads = [];
+    /** Map<"teamId:squadId", {time, name, creatorName, creatorEos, creatorDbId}>
+     *  — exact creation records from SQUAD_CREATED events (vehicle-claim
+     *  adjudication); merged into snapshot squads as createdAt. */
+    this.squadCreations = new Map();
+    /** Map<"squadId|name", rec> — creations whose team is not known yet (the
+     *  creator was not rostered when the event arrived); resolved against the
+     *  next ListSquads, which carries the authoritative team. */
+    this._pendingCreations = new Map();
+    /** mass squad turnover right after NEW_GAME is a map change, not disbands */
+    this._suppressDisbandUntil = 0;
+    /** armed on RCON disconnect: the first ListSquads after a reconnect is a
+     *  catch-up, not evidence that the missing squads disbanded */
+    this._skipNextSquadDiff = false;
+    /** wall-clock stamp of the last world reset: one map change is observed up
+     *  to three times (all-squads-vanish poll, lagged NEW_GAME log line,
+     *  serverinfo echo) and must only reset the records once, or the later
+     *  echoes wipe creations from the NEW round */
+    this._lastWorldResetAt = 0;
     /** parsed ShowServerInfo (§6.4) or null */
     this.serverInfo = null;
     /** cached ListLayers names */
@@ -190,16 +208,124 @@ class LiveState extends EventEmitter {
   }
 
   applyListSquads(rows) {
-    this.squads = Array.isArray(rows) ? rows.slice() : [];
+    const next = Array.isArray(rows) ? rows.slice() : [];
+    const prev = this.squads;
+    this.squads = next;
+    // Attach pending creations first — baseline-safe on every poll, gated or
+    // not: ListSquads names the team the creation event could not resolve.
+    for (const sq of next) {
+      if (sq == null || sq.squadId == null || this.squadCreations.has(`${sq.teamId}:${sq.squadId}`)) continue;
+      const pkey = `${sq.squadId}|${sq.name}`;
+      const pending = this._pendingCreations.get(pkey);
+      if (!pending) continue;
+      if (pending.creatorName != null && sq.creatorName != null && pending.creatorName !== sq.creatorName) continue;
+      this._pendingCreations.delete(pkey);
+      this.squadCreations.set(`${sq.teamId}:${sq.squadId}`, pending);
+    }
+    // An RCON outage may have spanned anything (even a map change): the first
+    // poll after reconnect only establishes the new baseline.
+    if (this._skipNextSquadDiff) {
+      this._skipNextSquadDiff = false;
+      this.emit('squads-updated');
+      return;
+    }
+    // Every squad vanishing at once is a world transition (map change / seed
+    // reset), not simultaneous disbands — NEW_GAME often arrives late (lagged
+    // log) or never (no log source configured), so detect it from the poll
+    // itself: reset quietly and suppress the diff briefly.
+    if (prev.length >= 2 && next.length === 0) {
+      this.squadCreations.clear();
+      this._pendingCreations.clear();
+      this._suppressDisbandUntil = Date.now() + 30000;
+      this._lastWorldResetAt = Date.now();
+      this.emit('squads-updated');
+      return;
+    }
+    // Disband detection: a squad present in the last poll and gone now. The
+    // first 30s after NEW_GAME are suppressed — map change clears every squad.
+    if (prev.length && Date.now() >= this._suppressDisbandUntil) {
+      const alive = new Set(next.map((s) => `${s.teamId}:${s.squadId}`));
+      for (const sq of prev) {
+        if (!sq || sq.teamId == null || sq.squadId == null) continue;
+        const key = `${sq.teamId}:${sq.squadId}`;
+        if (alive.has(key)) continue;
+        const created = this.squadCreations.get(key) || null;
+        this.squadCreations.delete(key);
+        this.emit('squad-disbanded', {
+          time: Date.now(), teamId: sq.teamId, squadId: sq.squadId, name: sq.name,
+          creatorName: sq.creatorName != null ? sq.creatorName : (created ? created.creatorName : null),
+          createdAt: created ? created.time : null,
+        });
+      }
+    }
+    // Stale creation records: squad id reused for a differently-named squad
+    // without a SQUAD_CREATED we saw (log gap) — drop rather than mislabel.
+    for (const sq of next) {
+      const rec = this.squadCreations.get(`${sq.teamId}:${sq.squadId}`);
+      if (rec && rec.name != null && sq.name != null && rec.name !== sq.name) {
+        this.squadCreations.delete(`${sq.teamId}:${sq.squadId}`);
+      }
+    }
+    this.emit('squads-updated');
+  }
+
+  // Exact creation record from a SQUAD_CREATED event (log line or chat packet).
+  // teamId null = creator not rostered yet: parked until the next ListSquads.
+  noteSquadCreated({ teamId, squadId, name, time, creatorName, creatorEos, creatorDbId } = {}) {
+    if (squadId == null) return;
+    const rec = {
+      time: Number(time) || Date.now(),
+      name: name != null ? name : null,
+      creatorName: creatorName != null ? creatorName : null,
+      creatorEos: creatorEos != null ? creatorEos : null,
+      creatorDbId: creatorDbId != null ? creatorDbId : null,
+    };
+    if (teamId == null) {
+      this._pendingCreations.set(`${squadId}|${rec.name}`, rec);
+      if (this._pendingCreations.size > 40) {
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        for (const [k, r] of this._pendingCreations) {
+          if (r.time < cutoff) this._pendingCreations.delete(k);
+        }
+      }
+      return;
+    }
+    this.squadCreations.set(`${teamId}:${squadId}`, rec);
+  }
+
+  // NEW_GAME: every squad dissolves with the map — clear without emitting
+  // a storm of 'squad-disbanded' events.
+  clearSquadsForNewGame() {
+    // The same transition arrives up to three ways (poll wipe, NEW_GAME line,
+    // serverinfo echo); only the first one resets — later echoes would wipe
+    // squads already created in the new round.
+    if (Date.now() - this._lastWorldResetAt < 90000) return;
+    this._lastWorldResetAt = Date.now();
+    this.squads = [];
+    this.squadCreations.clear();
+    this._pendingCreations.clear();
+    this._suppressDisbandUntil = Date.now() + 30000;
     this.emit('squads-updated');
   }
 
   applyServerInfo(info) {
     if (!info || typeof info !== 'object') return;
+    const prevMap = this.serverInfo && this.serverInfo.mapName ? this.serverInfo.mapName : null;
     this.serverInfo = info;
     if (info.mapName) this.currentLayer = info.mapName;
     if (info.nextLayer) this.nextLayer = info.nextLayer;
+    // Authoritative map-change signal that works without any log source:
+    // every squad dissolved with the old world.
+    if (prevMap != null && info.mapName && info.mapName !== prevMap) {
+      this.clearSquadsForNewGame();
+    }
     this.emit('serverinfo-updated', info);
+  }
+
+  // Called when the RCON link drops: squads may change arbitrarily while we
+  // are blind, so the next poll must not be read as disbands.
+  noteRconDown() {
+    this._skipNextSquadDiff = true;
   }
 
   // ------------------------------------------------------------- snapshot
@@ -242,6 +368,7 @@ class LiveState extends EventEmitter {
     for (const sq of this.squads) {
       if (!sq) continue;
       const t = ensureTeam(sq.teamId != null ? sq.teamId : null);
+      const created = this.squadCreations.get(`${sq.teamId}:${sq.squadId}`) || null;
       t.squads.push({
         squadId: sq.squadId != null ? sq.squadId : null,
         teamId: t.teamId,
@@ -251,6 +378,8 @@ class LiveState extends EventEmitter {
         creatorName: sq.creatorName != null ? sq.creatorName : null,
         creatorEos: sq.creatorEos != null ? sq.creatorEos : null,
         creatorSteam: sq.creatorSteam != null ? sq.creatorSteam : null,
+        createdAt: created ? created.time : null, // exact, from SQUAD_CREATED
+        creatorDbId: created ? created.creatorDbId : null,
         players: [],
       });
     }

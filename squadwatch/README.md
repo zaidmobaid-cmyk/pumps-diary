@@ -20,8 +20,14 @@ alternative you run yourself, with deeper Squad-specific intel:
   demote commander, set next layer / change layer now, restart/end match, and a raw RCON
   console with history and autocomplete. Every action is **audit-logged** with the
   verbatim RCON response.
-- **Live view** — current teams, squads and players refreshed continuously, population &
-  tick-rate graphs, kill/chat feeds, recently-disconnected list (ban the rage-quitters).
+- **Live view** — a BattleMetrics-style single page: every team, squad and player
+  refreshed continuously next to one unified live feed (kills, chat, joins/leaves,
+  squad events) with filters and pause.
+- **Squad claims** — every squad's **exact creation time and creator** are recorded the
+  moment it is made (from the RCON event stream, so it works even without a log feed)
+  and shown with a per-team claim order — ends "we made the ARMOR squad first" vehicle
+  disputes with receipts. Disbands are tracked too, including which panel admin pulled
+  the trigger; per-squad disband buttons sit right in the live roster.
 - **Multi-admin** — builtin owner/admin/viewer roles plus custom roles with per-permission
   grants, one-time invite links for your admin team, login rate limiting.
 

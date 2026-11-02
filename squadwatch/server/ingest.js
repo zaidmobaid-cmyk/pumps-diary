@@ -91,11 +91,18 @@ class Ingest {
       this._onPkt = (pkt) => this.onChatPacket(pkt);
       this._onInfo = (info) => this.onServerInfo(info);
       this._onPlayers = () => this.onPlayersUpdated();
+      this._onSquadGone = (ev) => this.onSquadDisbanded(ev);
       this.bus.on('log-event', this._onLog);
       this.bus.on('chat-packet-parsed', this._onPkt);
       this.bus.on('serverinfo-updated', this._onInfo);
       this.bus.on('players-updated', this._onPlayers);
+      this.bus.on('squad-disbanded', this._onSquadGone);
     }
+    // SQUAD_CREATED cross-source dedupe: the same creation arrives via the
+    // RCON chat packet AND the log line when both sources are connected. Keyed
+    // WITHOUT the team (roster resolution can flip between the two arrivals)
+    // and per source, so a genuine recreate (same source twice) still counts.
+    this._squadCreateSeen = new Map(); // "squad|name|creator" -> {time, src, rowId, teamId}
   }
 
   stmt(sql) { return this.db.prepare(sql); }
@@ -180,6 +187,7 @@ class Ingest {
       if (this._onPkt) this.bus.removeListener('chat-packet-parsed', this._onPkt);
       if (this._onInfo) this.bus.removeListener('serverinfo-updated', this._onInfo);
       if (this._onPlayers) this.bus.removeListener('players-updated', this._onPlayers);
+      if (this._onSquadGone) this.bus.removeListener('squad-disbanded', this._onSquadGone);
     }
   }
 
@@ -351,6 +359,7 @@ class Ingest {
         case 'MATCH_STATE': this.handleMatchState(ev); break;
         case 'ROUND_ENDED': this.handleRoundEnded(ev); break;
         case 'TICK_RATE': this.handleTickRate(ev); break;
+        case 'SQUAD_CREATED': this.handleSquadCreated(ev, 'log'); break;
         case 'ADMIN_BROADCAST_LOG':
           this.bus.emit('broadcast', { time: Number(ev.time) || Date.now(), message: ev.message, from: ev.from });
           break;
@@ -364,6 +373,12 @@ class Ingest {
   onChatPacket(pkt) {
     try {
       if (!pkt) return;
+      if (pkt.kind === 'SQUAD_CREATED') {
+        // §19.1.11: squad creation also arrives as an RCON packet, so exact
+        // creation times work even before a log source is configured.
+        this.handleSquadCreated(pkt, 'rcon');
+        return;
+      }
       if (pkt.kind && pkt.kind !== 'CHAT') return; // only chat messages are stored here
       if (!pkt.kind && (pkt.channel == null || pkt.message == null)) return;
       const time = Number(pkt.time) || Date.now();
@@ -805,6 +820,106 @@ class Ingest {
     this.stmt('UPDATE flags SET details=? WHERE id=?').run(JSON.stringify(det), existing.id);
   }
 
+  // ----------------------------------------------------- squad lifecycle
+
+  // SQUAD_CREATED from either source (log line via onLogEvent, RCON packet via
+  // onChatPacket): resolve the creator, persist the exact creation record
+  // (vehicle-claim adjudication), stamp live state, announce on the bus.
+  handleSquadCreated(ev, src = 'log') {
+    try {
+      if (!ev || ev.squadId == null) return;
+      const time = Number(ev.time) || Date.now();
+      const name = ev.squadName != null ? String(ev.squadName) : null;
+      const creatorName = capName(ev.playerName);
+      const ids = String(ev.ids == null ? '' : ev.ids);
+      const eosM = /EOS:\s*([0-9a-f]{32})/i.exec(ids);
+      const steamM = /steam:\s*(\d{17})/i.exec(ids);
+      const eosId = eosM ? eosM[1].toLowerCase() : null;
+      const steamId = steamM ? steamM[1] : null;
+      // The squad lives on its creator's team. The event's team text is a
+      // faction display name ("78th Detached…"), useless for a team number —
+      // resolve via the live roster, and when the creator isn't rostered yet
+      // leave teamId null: state holds the record pending and attaches it on
+      // the next ListSquads, which knows the authoritative team.
+      const rec = eosId && this.state && typeof this.state.byEos === 'function' ? this.state.byEos(eosId) : null;
+      const live = rec || (creatorName && this.state && typeof this.state.byName === 'function' ? this.state.byName(creatorName) : null);
+      const teamId = live && live.teamId != null ? live.teamId : null;
+      const key = `${ev.squadId}|${name}|${creatorName}`;
+      const seen = this._squadCreateSeen.get(key);
+      if (seen && seen.src !== src && time - seen.time < 90000) {
+        // The other source's copy of the same creation. If we resolved the
+        // team and the first copy could not, enrich its row and the live
+        // record instead of double-inserting.
+        if (teamId != null && seen.teamId == null) {
+          seen.teamId = teamId;
+          if (seen.rowId != null) {
+            this.stmt('UPDATE squad_events SET team_id=? WHERE id=? AND team_id IS NULL').run(teamId, seen.rowId);
+          }
+          if (this.state && typeof this.state.noteSquadCreated === 'function') {
+            this.state.noteSquadCreated({
+              teamId, squadId: ev.squadId, name, time: seen.time,
+              creatorName, creatorEos: eosId, creatorDbId: seen.dbId != null ? seen.dbId : null,
+            });
+          }
+        }
+        return;
+      }
+      const p = this.getOrCreatePlayer({ eosId, steamId, name: creatorName, time });
+      if (live && p && !live.dbId) live.dbId = p.id;
+      const matchId = this.match ? this.match.id : null;
+      const ins = this.stmt(
+        `INSERT INTO squad_events(time, match_id, type, team_id, squad_id, name, player_id, player_name, by_user)
+         VALUES(?,?,?,?,?,?,?,?,NULL)`
+      ).run(time, matchId, 'created', teamId, ev.squadId, name, p ? p.id : null, creatorName);
+      this._squadCreateSeen.set(key, { time, src, rowId: Number(ins.lastInsertRowid), teamId, dbId: p ? p.id : null });
+      if (this._squadCreateSeen.size > 500) {
+        for (const [k, s] of this._squadCreateSeen) {
+          if (time - s.time > 5 * 60 * 1000) this._squadCreateSeen.delete(k);
+        }
+      }
+      if (this.state && typeof this.state.noteSquadCreated === 'function') {
+        this.state.noteSquadCreated({
+          teamId, squadId: ev.squadId, name, time,
+          creatorName, creatorEos: eosId, creatorDbId: p ? p.id : null,
+        });
+      }
+      if (this.bus) {
+        this.bus.emit('squad-created', {
+          time, matchId, teamId, squadId: ev.squadId, name,
+          creatorName, creatorDbId: p ? p.id : null,
+        });
+      }
+    } catch (e) {
+      log.error('ingest', `squad-created failed: ${e.message}`);
+    }
+  }
+
+  // Poll-diff disband (state.applyListSquads) — persist unless the panel's
+  // disband endpoint already recorded this squad seconds ago (it knows the
+  // acting admin; the poll echo does not).
+  onSquadDisbanded(ev) {
+    try {
+      if (!ev || ev.squadId == null) return;
+      const time = Number(ev.time) || Date.now();
+      // Name participates in the dedupe: squad ids are reused within seconds,
+      // and a recreated squad's own disband is a distinct event.
+      const dup = this.stmt(
+        `SELECT id FROM squad_events WHERE type='disbanded' AND team_id IS ? AND squad_id = ?
+          AND name IS ? AND time > ? ORDER BY id DESC LIMIT 1`
+      ).get(ev.teamId == null ? null : ev.teamId, ev.squadId,
+        ev.name == null ? null : ev.name, time - 30000);
+      if (dup) return;
+      this.stmt(
+        `INSERT INTO squad_events(time, match_id, type, team_id, squad_id, name, player_id, player_name, by_user)
+         VALUES(?,?,?,?,?,?,NULL,?,NULL)`
+      ).run(time, this.match ? this.match.id : null, 'disbanded',
+        ev.teamId == null ? null : ev.teamId, ev.squadId,
+        ev.name == null ? null : ev.name, ev.creatorName == null ? null : ev.creatorName);
+    } catch (e) {
+      log.error('ingest', `squad-disbanded failed: ${e.message}`);
+    }
+  }
+
   // --------------------------------------------------------- match lifecycle
 
   handleNewGame(ev) {
@@ -820,6 +935,10 @@ class Ingest {
       .run(layer, level, layerClass, time);
     this.match = { id: r.lastInsertRowid, layer, level, layerClass, team1: null, team2: null, startedAt: time };
     if (this.state) this.state.match = this.match;
+    // Map change dissolves every squad — reset quietly (no disband storm).
+    if (this.state && typeof this.state.clearSquadsForNewGame === 'function') {
+      this.state.clearSquadsForNewGame();
+    }
     // team1/team2 (and a display layer, if ours is missing) arrive with the next serverinfo-updated.
     this.bus.emit('match-start', { matchId: this.match.id, layer, level, team1: null, team2: null, startedAt: time });
   }

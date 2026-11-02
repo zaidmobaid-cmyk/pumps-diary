@@ -55,8 +55,8 @@ test('openDb returns the normalized wrapper and applies WAL pragmas', (t) => {
 test('migrate() applies the full v1 DDL and is idempotent, including on a reopened existing db', (t) => {
   const file = tmpDbPath(t);
   const db1 = openDb(file);
-  assert.equal(db1.migrate(), 2);
-  assert.equal(db1.migrate(), 2, 'second migrate on the same handle is a no-op');
+  assert.equal(db1.migrate(), 4);
+  assert.equal(db1.migrate(), 4, 'second migrate on the same handle is a no-op');
 
   const names = db1.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((r) => r.name);
   for (const tbl of EXPECTED_TABLES) assert.ok(names.includes(tbl), `missing table ${tbl}`);
@@ -77,13 +77,13 @@ test('migrate() applies the full v1 DDL and is idempotent, including on a reopen
 
   // Survive a write so the reopen below sees a genuinely existing, used db.
   db1.prepare('INSERT INTO settings(key, value) VALUES(?,?)').run('hello', 'world');
-  assert.equal(db1.prepare('SELECT version FROM schema_version').get().version, 2);
+  assert.equal(db1.prepare('SELECT version FROM schema_version').get().version, 4);
   db1.close();
 
   const db2 = openDb(file);
   t.after(() => db2.close());
-  assert.equal(db2.migrate(), 2, 'migrate on an existing db does not re-apply DDL');
-  assert.equal(db2.migrate(), 2);
+  assert.equal(db2.migrate(), 4, 'migrate on an existing db does not re-apply DDL');
+  assert.equal(db2.migrate(), 4);
   assert.equal(db2.prepare('SELECT value FROM settings WHERE key=?').get('hello').value, 'world');
   assert.equal(db2.prepare('SELECT COUNT(*) AS n FROM schema_version').get().n, 1);
 });

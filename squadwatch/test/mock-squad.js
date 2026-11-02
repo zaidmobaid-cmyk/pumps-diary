@@ -398,6 +398,12 @@ class MockSquad extends EventEmitter {
       squad.squadId + ' (Squad Name: ' + squad.name + ') on Team ' + this.teams[p.teamId].name,
       time
     );
+    // §19.1.11: real Squad also announces creation over the RCON chat-packet
+    // stream (no LogSquad prefix), so creation times work without a log feed.
+    this.sendChatPacket(
+      p.name + ' (Online IDs: ' + this._idsBlob(p) + ') has created Squad ' +
+      squad.squadId + ' (Squad Name: ' + squad.name + ') on Team ' + this.teams[p.teamId].name
+    );
     return squad;
   }
 

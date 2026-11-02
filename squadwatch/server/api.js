@@ -457,6 +457,9 @@ function createApi(deps) {
     ['log-status', (s) => { lastLogStatus = s; sseBroadcast('status', statusPayload()); }],
     ['broadcast', (p) => sseBroadcast('broadcast', p)],
     ['pop-sample', (p) => sseBroadcast('pop', p)],
+    ['squad-created', (p) => sseBroadcast('squad', Object.assign({ type: 'created' }, p))],
+    ['squad-disbanded', (p) => sseBroadcast('squad', Object.assign({ type: 'disbanded' }, p))],
+    ['squad-disbanded-admin', (p) => sseBroadcast('squad', Object.assign({ type: 'disbanded' }, p))],
   ];
   if (bus) for (const [ev, fn] of busWiring) bus.on(ev, fn);
 
@@ -597,6 +600,56 @@ function createApi(deps) {
       counters,
       recent: { kills, chat, flags },
     });
+  }
+
+  // GET /api/live/feed — backfill for the Live page's unified feed: recent
+  // kills, chat (viewer-filtered), squad created/disbanded, joins/leaves,
+  // merged newest-first. Live updates then ride the SSE stream.
+  function hLiveFeed(ctx) {
+    const limit = clampInt(ctx.query.get('limit'), 10, 300, 120);
+    const out = [];
+    const kills = db.prepare(`${KILL_SELECT} WHERE k.kind = 'wound' ORDER BY k.id DESC LIMIT ?`).all(limit).map(killRow);
+    for (const k of kills) out.push({ t: k.time, kind: 'kill', data: k });
+    const chat = db.prepare(
+      `SELECT c.id, c.time, c.match_id, c.channel, c.message, c.player_id, p.name AS player_name
+         FROM chat c LEFT JOIN players p ON p.id = c.player_id
+        WHERE 1=1${viewerChatCond(ctx.user, 'c')} ORDER BY c.id DESC LIMIT ?`
+    ).all(limit).map(chatRow);
+    for (const c of chat) out.push({ t: c.time, kind: 'chat', data: c });
+    const squads = db.prepare(
+      `SELECT se.*, u.username AS by_username FROM squad_events se
+         LEFT JOIN users u ON u.id = se.by_user ORDER BY se.id DESC LIMIT ?`
+    ).all(limit);
+    for (const s of squads) {
+      out.push({
+        t: s.time, kind: 'squad',
+        data: {
+          type: s.type, time: s.time, teamId: s.team_id, squadId: s.squad_id, name: s.name,
+          creatorName: s.player_name, creatorDbId: s.player_id, byUser: s.by_username || null,
+        },
+      });
+    }
+    // Connects: session rows are created at connect, so id order IS connect
+    // order. Disconnects: disconnect_at is updated in place on old rows, so
+    // they need their own query (and index) or long sessions' leavers vanish
+    // from the backfill.
+    const conns = db.prepare(
+      `SELECT s.connect_at, s.player_id, p.name AS name FROM sessions s
+         LEFT JOIN players p ON p.id = s.player_id ORDER BY s.id DESC LIMIT ?`
+    ).all(limit);
+    for (const s of conns) {
+      if (s.connect_at != null) out.push({ t: s.connect_at, kind: 'connect', data: { time: s.connect_at, playerDbId: s.player_id, name: s.name } });
+    }
+    const disc = db.prepare(
+      `SELECT s.disconnect_at, s.player_id, p.name AS name FROM sessions s
+         LEFT JOIN players p ON p.id = s.player_id
+        WHERE s.disconnect_at IS NOT NULL ORDER BY s.disconnect_at DESC LIMIT ?`
+    ).all(limit);
+    for (const s of disc) {
+      out.push({ t: s.disconnect_at, kind: 'disconnect', data: { time: s.disconnect_at, playerDbId: s.player_id, name: s.name } });
+    }
+    out.sort((a, b) => b.t - a.t);
+    return json(ctx.res, 200, { rows: out.slice(0, limit) });
   }
 
   function hPop(ctx) {
@@ -1123,7 +1176,33 @@ function createApi(deps) {
     return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
   }
   async function hDisbandSquad(ctx) {
+    const teamId = intParam(ctx.body.teamId, 'teamId');
+    const squadId = intParam(ctx.body.squadId, 'squadId');
     const r = await doAdmin(ctx, 'disbandSquad', { teamId: ctx.body.teamId, squadId: ctx.body.squadId });
+    if (r.rconOk) {
+      // Record who pulled the trigger NOW (ingest's poll-diff echo skips the
+      // insert when it sees this row) and update the live view immediately.
+      try {
+        const sq = (state && state.squads || []).find((s) => s && s.teamId === teamId && s.squadId === squadId) || null;
+        const created = state && state.squadCreations ? state.squadCreations.get(`${teamId}:${squadId}`) : null;
+        const now = Date.now();
+        db.prepare(
+          `INSERT INTO squad_events(time, match_id, type, team_id, squad_id, name, player_id, player_name, by_user)
+           VALUES(?,?,?,?,?,?,NULL,?,?)`
+        ).run(now, state && state.match ? state.match.id : null, 'disbanded', teamId, squadId,
+          sq ? sq.name : null, sq ? sq.creatorName : (created ? created.creatorName : null), ctx.user.id);
+        if (state) {
+          state.squads = (state.squads || []).filter((s) => !(s && s.teamId === teamId && s.squadId === squadId));
+          if (state.squadCreations) state.squadCreations.delete(`${teamId}:${squadId}`);
+        }
+        if (bus) {
+          bus.emit('squad-disbanded-admin', {
+            time: now, teamId, squadId, name: sq ? sq.name : null,
+            creatorName: sq ? sq.creatorName : null, byUser: ctx.user.username,
+          });
+        }
+      } catch (_e) { /* the RCON action itself succeeded; history is best-effort */ }
+    }
     return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
   }
   async function hDemoteCommander(ctx) {
@@ -1562,6 +1641,7 @@ function createApi(deps) {
   route('GET', /^\/api\/overview$/, { perm: 'view' }, hOverview);
   route('GET', /^\/api\/stream$/, { perm: 'stream' }, hStream);
   route('GET', /^\/api\/pop$/, { perm: 'view' }, hPop);
+  route('GET', /^\/api\/live\/feed$/, { perm: 'view' }, hLiveFeed);
   route('GET', /^\/api\/players$/, { perm: 'view' }, hPlayers);
   route('GET', /^\/api\/players\/(\d+)$/, { perm: 'view' }, hPlayer);
   route('GET', /^\/api\/players\/(\d+)\/chat$/, { perm: 'view' }, hPlayerChat);

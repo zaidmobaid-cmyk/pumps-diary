@@ -2,7 +2,9 @@
 /* SquadWatch — views.js (stage 2: data views)
  *
  * Registers SW.routes.players (+ profile), SW.routes.matches (+ detail),
- * SW.routes.chat and SW.routes.trolls per spec §14.3 and §19 amendments.
+ * SW.routes.chat and SW.routes.trolls per spec §14.3 and §19 amendments,
+ * plus the rebuilt SW.routes.live (BattleMetrics-style roster + unified
+ * live feed), which overrides the stage-1 live route from app.js.
  *
  * Conventions (established by app.js):
  *   - SW.routes[name] = { render(el, ctx), cleanup() }; render runs with
@@ -1565,6 +1567,584 @@
     })();
   }
 
+  /* ============================================== LIVE (BattleMetrics-style)
+   * Overrides the stage-1 SW.routes.live from app.js (views.js loads after
+   * app.js and before boot()). Two panes: left = roster (teams > squads with
+   * creation time / claim order / creator + per-squad Disband), right = one
+   * unified live feed (kills, chat, joins/leaves, squad created/disbanded)
+   * backfilled from GET /api/live/feed and kept live over SSE.
+   *
+   * Roster-refresh approach for squad creation lines: a local overlay map
+   * keyed "teamId:squadId" is filled from 'squad' SSE events so the created/
+   * claim line appears instantly; the authoritative snapshot (squads carry
+   * createdAt/creatorDbId) wins as soon as the next 'players' event lands,
+   * and the overlay is pruned against it.
+   */
+
+  const FEED_FILTERS = [
+    { value: 'kill', label: 'Kills' },
+    { value: 'chat', label: 'Chat' },
+    { value: 'join', label: 'Joins' },
+    { value: 'squad', label: 'Squads' },
+  ];
+  const FEED_KIND_VALUES = FEED_FILTERS.map((f) => f.value);
+  function feedGroupOf(kind) {
+    return kind === 'connect' || kind === 'disconnect' ? 'join' : kind;
+  }
+
+  function abbrevRole(role) {
+    if (!role) return '';
+    const parts = String(role).split('_').filter(Boolean);
+    if (parts.length >= 2) return parts[1];
+    return parts[0] || '';
+  }
+
+  function renderLive(main) {
+    const unsubs = [];
+    let renderTimer = null;
+    let lastRender = 0;
+    this.cleanup = () => {
+      unsubs.forEach((u) => u());
+      if (renderTimer) clearTimeout(renderTimer);
+    };
+
+    const page = el('div', { class: 'view view-live' });
+    main.append(page);
+
+    /* ---- admin topline (kept from the previous live view): broadcast quick
+     * box + next-layer quick set, each behind its own perm (§1) ---- */
+    if (SW.can('broadcast') || SW.can('layer')) {
+      const tools = el('div', { class: 'card live-tools' });
+      if (SW.can('broadcast')) {
+        const bWrap = el('div', { class: 'tool-group grow' });
+        const bInput = el('input', { class: 'input grow', placeholder: 'Broadcast message to all players…', maxlength: '480', 'aria-label': 'Broadcast message' });
+        const bBtn = el('button', { type: 'button', class: 'btn primary', html: SW.icon('broadcast') + '<span>Send</span>' });
+        const sendB = async () => {
+          const msg = bInput.value.trim();
+          if (!msg) return;
+          bBtn.disabled = true;
+          try { await SW.actions.broadcastSend(msg); bInput.value = ''; } catch (_e) { /* toasted */ }
+          bBtn.disabled = false;
+        };
+        bBtn.addEventListener('click', sendB);
+        bInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendB(); });
+        bWrap.append(bInput, bBtn);
+        tools.append(bWrap);
+      }
+      if (SW.can('layer')) {
+        const lWrap = el('div', { class: 'tool-group' });
+        const dl = el('datalist', { id: 'layers-dl' });
+        const lInput = el('input', { class: 'input', placeholder: 'Next layer…', list: 'layers-dl', 'aria-label': 'Next layer' });
+        const lBtn = el('button', { type: 'button', class: 'btn', text: 'Set next' });
+        lBtn.addEventListener('click', async () => {
+          const L = lInput.value.trim();
+          if (!L) return;
+          lBtn.disabled = true;
+          try { await SW.actions.setNextLayer(L); lInput.value = ''; } catch (_e) { /* toasted */ }
+          lBtn.disabled = false;
+        });
+        lWrap.append(lInput, dl, lBtn);
+        tools.append(lWrap);
+        SW.actions.fetchLayers().then((layers) => {
+          dl.textContent = '';
+          for (const L of layers) dl.append(el('option', { value: L }));
+        }).catch(() => { /* rcon down */ });
+      }
+      page.append(tools);
+    }
+
+    /* ---- two-pane layout: roster left, unified feed right ---- */
+    const layout = el('div', { class: 'live-bm' });
+    const left = el('div', { class: 'live-roster-col' });
+    const right = el('div', { class: 'live-feed-col' });
+    layout.append(left, right);
+    page.append(layout);
+
+    const rosterWrap = el('div', { class: 'live-grid' });
+    const discWrap = el('div', { class: 'card disc-panel' });
+    left.append(rosterWrap, discWrap);
+
+    /* =================================================== roster (left pane) */
+
+    /* squad-creation overlay: 'squad' SSE events land here instantly; the
+     * snapshot's own createdAt/creatorDbId take precedence once present. */
+    const overlay = new Map(); // "teamId:squadId" -> {createdAt, creatorName, creatorDbId, name}
+
+    function overlayFor(sq) {
+      const direct = overlay.get(sq.teamId + ':' + sq.squadId);
+      if (direct && (direct.name == null || sq.name == null || direct.name === sq.name)) return direct;
+      /* creator not rostered when the event fired -> event had teamId null;
+       * only trust it when the squad name matches exactly AND the record is
+       * fresh — squad numbers and names (ARMOR, HELI, CMD) recur, and a stale
+       * anon record must not hand a later squad someone else's claim. */
+      const anon = overlay.get('null:' + sq.squadId);
+      if (anon && anon.name != null && sq.name != null && anon.name === sq.name
+        && anon.createdAt != null && Date.now() - anon.createdAt < 10 * 60 * 1000) return anon;
+      return null;
+    }
+
+    /* best known creation record for a snapshot squad */
+    function creationOf(sq) {
+      if (sq.createdAt != null) {
+        return { createdAt: num(sq.createdAt), creatorName: sq.creatorName, creatorDbId: g(sq, 'creatorDbId') };
+      }
+      const ov = overlayFor(sq);
+      if (ov && ov.createdAt != null) {
+        return {
+          createdAt: ov.createdAt,
+          creatorName: sq.creatorName != null ? sq.creatorName : ov.creatorName,
+          creatorDbId: ov.creatorDbId,
+        };
+      }
+      return { createdAt: null, creatorName: sq.creatorName != null ? sq.creatorName : null, creatorDbId: g(sq, 'creatorDbId') };
+    }
+
+    function pruneOverlay() {
+      if (!overlay.size) return;
+      const now = Date.now();
+      const snap = SW.state.snapshot;
+      for (const [key, rec] of overlay) {
+        // Anon (team-unknown) records age out fast; teamed ones get longer.
+        const ttl = key.startsWith('null:') ? 10 * 60 * 1000 : 45 * 60 * 1000;
+        if (rec.createdAt != null && now - rec.createdAt > ttl) { overlay.delete(key); continue; }
+        if (!snap || !snap.teams) continue;
+        for (const t of snap.teams) {
+          const sq = (t.squads || []).find((s) => s && (t.teamId + ':' + s.squadId) === key);
+          if (sq && sq.createdAt != null) { overlay.delete(key); break; }
+          // An anon record is also done the moment the snapshot itself knows
+          // this squad's creation (matched by number + name on any team).
+          if (key.startsWith('null:')) {
+            const m = (t.squads || []).find((s) => s && ('null:' + s.squadId) === key
+              && s.name === rec.name && s.createdAt != null);
+            if (m) { overlay.delete(key); break; }
+          }
+        }
+      }
+    }
+
+    /* claim order: 1-based rank of createdAt among the SAME team's current
+     * squads; squads with unknown createdAt rank last and get no number. */
+    function claimRanks(team) {
+      const ranked = (team.squads || [])
+        .map((sq) => ({ sq, c: creationOf(sq) }))
+        .filter((e) => e.c.createdAt != null)
+        .sort((a, b) => a.c.createdAt - b.c.createdAt);
+      const map = new Map();
+      ranked.forEach((e, i) => map.set(e.sq, i + 1));
+      return map;
+    }
+
+    function claimLine(sq, ranks) {
+      const line = el('div', { class: 'squad-claim' });
+      const cr = creationOf(sq);
+      const rank = ranks.get(sq);
+      if (rank != null) {
+        line.append(el('span', {
+          class: 'claim-rank mono',
+          text: '#' + rank,
+          title: 'Creation order on this team — #1 was created first (vehicle-claim priority)',
+        }));
+      }
+      if (cr.createdAt != null) {
+        const when = new Date(cr.createdAt);
+        line.title = 'Created ' + when.toLocaleString();
+        line.append(el('span', { class: 'dim', text: 'created ' + when.toLocaleTimeString() + ' (' }));
+        line.append(SW.ui.timeAgo(cr.createdAt));
+        line.append(el('span', { class: 'dim', text: ')' }));
+      } else {
+        line.append(el('span', {
+          class: 'faint', text: 'created before SquadWatch connected',
+          title: 'Creation time unknown — this squad existed before SquadWatch started watching the logs',
+        }));
+      }
+      if (cr.creatorName) {
+        line.append(el('span', { class: 'dim', text: '· by' }));
+        line.append(cr.creatorDbId != null
+          ? SW.ui.playerLink({ dbId: cr.creatorDbId, name: cr.creatorName })
+          : el('span', { class: 'squad-creator', text: cr.creatorName }));
+      }
+      return line;
+    }
+
+    function playerRow(p) {
+      const row = el('div', { class: 'player-row' });
+      if (p.isLeader) row.append(el('span', { class: 'sl-star', html: SW.icon('star'), title: 'Squad leader' }));
+      row.append(SW.ui.playerLink(p, { class: 'grow' }));
+      const role = abbrevRole(p.role);
+      if (role) row.append(el('span', { class: 'role-tag mono', text: role }));
+      const tks = num(p.sessTks);
+      const kd = el('span', { class: 'kd mono' + (tks > 0 ? ' has-tk' : '') });
+      kd.innerHTML = '<i>K</i>' + num(p.sessKills) +
+        ' <i>D</i>' + num(p.sessDeaths) +
+        ' <i class="' + (tks > 0 ? 'tkc' : '') + '">TK</i>' + tks;
+      row.append(kd);
+      return row;
+    }
+
+    function disbandBtn(team, sq) {
+      const btn = el('button', {
+        type: 'button', class: 'btn danger ghost small squad-disband',
+        text: 'Disband', title: 'Disband this squad (members become unassigned)',
+      });
+      btn.addEventListener('click', async () => {
+        const teamId = num(team.teamId);
+        const squadId = num(sq.squadId);
+        const label = squadId + ' — ' + (sq.name || 'Squad') + ' (' + ((sq.players && sq.players.length) || sq.size || 0) + ')';
+        const v = await SW.ui.confirmModal({
+          title: 'Disband squad',
+          body: 'Disband squad ' + label + ' on team ' + teamId + '? Its members become unassigned.',
+          danger: true,
+          confirmText: 'Disband',
+        });
+        if (!v) return;
+        btn.disabled = true;
+        try {
+          const res = await SW.api('/api/admin/disbandSquad', { method: 'POST', body: { teamId, squadId } });
+          SW.ui.rconToast('Disband squad ' + squadId + ' (team ' + teamId + ')', res);
+          /* roster re-renders on the next players/squad SSE event */
+        } catch (_e) { btn.disabled = false; /* toasted by SW.api */ }
+      });
+      return btn;
+    }
+
+    function squadCard(team, sq, ranks) {
+      const c = el('div', { class: 'squad-card' });
+      const head = el('div', { class: 'squad-head' });
+      if (sq.squadId != null) head.append(el('span', { class: 'squad-id mono', text: String(sq.squadId) }));
+      head.append(el('span', { class: 'squad-name', text: sq.name || 'Squad' }));
+      if (sq.locked) head.append(el('span', { class: 'squad-lock', html: SW.icon('lock'), title: 'Locked squad' }));
+      const n = sq.players ? sq.players.length : num(sq.size);
+      head.append(el('span', { class: 'squad-size dim', text: n + '/9' }));
+      if (SW.can('squad') && team.teamId != null && sq.squadId != null) head.append(disbandBtn(team, sq));
+      c.append(head);
+      c.append(claimLine(sq, ranks));
+      for (const p of sq.players || []) c.append(playerRow(p));
+      return c;
+    }
+
+    function renderRoster() {
+      rosterWrap.textContent = '';
+      const snap = SW.state.snapshot;
+      if (!snap || !snap.teams || !snap.teams.length) {
+        rosterWrap.append(SW.ui.empty('No live roster yet — waiting for RCON ListPlayers', 'live'));
+        renderDisc();
+        return;
+      }
+      for (const team of snap.teams) {
+        const col = el('div', { class: 'team-col team' + (team.teamId === 2 ? '2' : '1') });
+        const count = (team.squads || []).reduce((n, s) => n + ((s.players && s.players.length) || 0), 0) +
+          ((team.unassigned && team.unassigned.length) || 0);
+        const head = el('div', { class: 'team-head' });
+        head.append(el('span', { class: 'team-name', text: team.name || ('Team ' + team.teamId) }));
+        const meta = el('span', { class: 'team-count dim' });
+        const tickets = g(team, 'tickets');
+        if (tickets != null) meta.append(el('span', { class: 'mono', text: num(tickets) + ' tickets · ' }));
+        meta.append(count + ' players');
+        head.append(meta);
+        col.append(head);
+        const ranks = claimRanks(team);
+        for (const sq of team.squads || []) col.append(squadCard(team, sq, ranks));
+        if (team.unassigned && team.unassigned.length) {
+          const u = el('div', { class: 'squad-card unassigned' });
+          const uh = el('div', { class: 'squad-head' });
+          uh.append(el('span', { class: 'squad-name dim', text: 'Unassigned' }));
+          uh.append(el('span', { class: 'squad-size dim', text: String(team.unassigned.length) }));
+          u.append(uh);
+          for (const p of team.unassigned) u.append(playerRow(p));
+          col.append(u);
+        }
+        rosterWrap.append(col);
+      }
+      renderDisc();
+    }
+
+    function renderDisc() {
+      discWrap.textContent = '';
+      discWrap.append(el('div', { class: 'card-title', text: 'Recently disconnected' }));
+      const snap = SW.state.snapshot;
+      const list = (snap && snap.recentlyDisconnected) || [];
+      if (!list.length) {
+        discWrap.append(el('div', { class: 'dim small pad-s', text: 'Nobody left recently' }));
+        return;
+      }
+      for (const d of list) {
+        const row = el('div', { class: 'disc-row' });
+        row.append(SW.ui.playerLink(d, { class: 'grow' }));
+        const since = d.sinceDisconnect || (d.disconnectedAt ? SW.ui.timeAgoText(d.disconnectedAt) : '');
+        row.append(el('span', { class: 'dim small mono', text: since }));
+        if (SW.can('ban')) {
+          const b = el('button', { type: 'button', class: 'btn danger ghost small', text: 'Ban anyway' });
+          b.addEventListener('click', () => SW.actions.ban(d));
+          row.append(b);
+        }
+        discWrap.append(row);
+      }
+    }
+
+    /* re-render throttled to 2s (spec 14.4) */
+    function scheduleRender() {
+      if (renderTimer) return;
+      const wait = Math.max(0, 2000 - (Date.now() - lastRender));
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        lastRender = Date.now();
+        renderRoster();
+      }, wait);
+    }
+
+    /* kill events bump session K/D/TK between snapshots */
+    function bump(ref, field) {
+      const snap = SW.state.snapshot;
+      if (!ref || !ref.eosId || !snap || !snap.teams) return;
+      for (const t of snap.teams) {
+        const buckets = (t.squads || []).map((s) => s.players || []);
+        buckets.push(t.unassigned || []);
+        for (const bucket of buckets) {
+          for (const p of bucket) {
+            if (p.eosId === ref.eosId) { p[field] = (Number(p[field]) || 0) + 1; return; }
+          }
+        }
+      }
+    }
+
+    /* ================================================= live feed (right pane) */
+
+    const EV_CAP = 400;   // in-memory event buffer
+    const DOM_CAP = 300;  // rendered rows
+
+    let filters = SW.prefs.get('live:feed-filters', null);
+    if (!Array.isArray(filters) || !filters.length ||
+      filters.some((f) => FEED_KIND_VALUES.indexOf(f) === -1)) {
+      filters = FEED_KIND_VALUES.slice();
+    }
+    let paused = false;
+    let pending = 0;
+    const events = []; // {t, kind, data} newest first
+
+    const feedCard = el('div', { class: 'card live-feed-card' });
+    right.append(feedCard);
+
+    const head = el('div', { class: 'card-title live-feed-head' });
+    head.append(el('span', { html: SW.icon('live') }), el('span', { text: 'Live feed' }));
+    const pendBadge = el('span', { class: 'badge warn feed-pending hidden', title: 'Events buffered while paused' });
+    const pauseBtn = el('button', { type: 'button', class: 'icon-btn feed-pause' });
+    function syncPause() {
+      pauseBtn.innerHTML = SW.icon(paused ? 'play' : 'pause');
+      pauseBtn.title = paused ? 'Resume feed' : 'Pause feed';
+      pauseBtn.classList.toggle('active', paused);
+      pendBadge.textContent = pending ? '+' + pending : '';
+      pendBadge.classList.toggle('hidden', !paused || !pending);
+    }
+    pauseBtn.addEventListener('click', () => {
+      paused = !paused;
+      if (!paused) { pending = 0; redraw(); }
+      syncPause();
+    });
+    syncPause();
+    head.append(el('span', { class: 'feed-right' }, pendBadge, pauseBtn));
+    feedCard.append(head);
+
+    /* filter chips: All + multi-toggle kinds, persisted */
+    const chipRow = el('div', { class: 'feed-filters' });
+    const allChip = el('button', { type: 'button', class: 'chip', text: 'All' });
+    const kindChips = [];
+    function syncChips() {
+      allChip.classList.toggle('on', filters.length === FEED_KIND_VALUES.length);
+      for (const [b, val] of kindChips) b.classList.toggle('on', filters.indexOf(val) !== -1);
+    }
+    function setFilters(next) {
+      filters = next;
+      SW.prefs.set('live:feed-filters', filters);
+      syncChips();
+      redraw();
+    }
+    allChip.addEventListener('click', () => setFilters(FEED_KIND_VALUES.slice()));
+    chipRow.append(allChip);
+    for (const f of FEED_FILTERS) {
+      const b = el('button', { type: 'button', class: 'chip', text: f.label });
+      b.addEventListener('click', () => {
+        const i = filters.indexOf(f.value);
+        const next = filters.slice();
+        if (i === -1) next.push(f.value); else next.splice(i, 1);
+        setFilters(next);
+      });
+      kindChips.push([b, f.value]);
+      chipRow.append(b);
+    }
+    syncChips();
+    feedCard.append(chipRow);
+
+    const feedList = el('div', { class: 'feed live-feed' });
+    feedCard.append(feedList);
+
+    function passes(ev) { return filters.indexOf(feedGroupOf(ev.kind)) !== -1; }
+
+    /* row renderers — kills/chat reuse the shared builders; every dynamic
+     * string below goes through textContent (no innerHTML with user data) */
+    function connRow(kind, data) {
+      data = data || {};
+      const ref = (data.player && typeof data.player === 'object')
+        ? data.player
+        : { dbId: g(data, 'playerDbId', 'playerId'), name: data.name };
+      const row = el('div', { class: 'feed-row conn-line ' + (kind === 'connect' ? 'in' : 'out') });
+      row.append(el('span', { class: kind === 'connect' ? 'online-dot' : 'offline-dot' }));
+      row.append(SW.ui.playerLink(ref));
+      row.append(el('span', { class: 'dim small', text: kind === 'connect' ? 'connected' : 'disconnected' }));
+      row.append(SW.ui.timeAgo(data.time));
+      return row;
+    }
+
+    function squadEvRow(d) {
+      d = d || {};
+      const admin = d.type === 'disbanded' && d.byUser;
+      const row = el('div', { class: 'feed-row squad-ev' + (admin ? ' admin' : '') });
+      row.append(el('span', { class: 'squad-ev-icon', html: SW.icon('users') }));
+      const main = el('span', { class: 'feed-main squad-ev-main' });
+      main.append(el('span', { class: 'dim', text: 'Squad ' + (d.squadId != null ? d.squadId : '?') }));
+      if (d.name) main.append(el('b', { class: 'squad-ev-name', text: '‘' + d.name + '’' }));
+      main.append(el('span', {
+        class: d.type === 'created' ? 'squad-ev-verb created' : 'squad-ev-verb',
+        text: d.type === 'created' ? 'created' : 'disbanded',
+      }));
+      if (d.type === 'created' && d.creatorName) {
+        main.append(el('span', { class: 'dim', text: 'by' }));
+        main.append(d.creatorDbId != null
+          ? SW.ui.playerLink({ dbId: d.creatorDbId, name: d.creatorName })
+          : el('span', { text: d.creatorName }));
+      }
+      if (d.teamId != null) main.append(teamBadge(d.teamId));
+      if (admin) main.append(el('span', { class: 'goldc small', text: '— disbanded by admin ' + d.byUser }));
+      row.append(main);
+      row.append(SW.ui.timeAgo(d.time));
+      return row;
+    }
+
+    function rowFor(ev) {
+      try {
+        if (ev.kind === 'kill') return SW.ui.killRow(normKill(ev.data));
+        if (ev.kind === 'chat') return SW.ui.chatRow(normChat(ev.data));
+        if (ev.kind === 'squad') return squadEvRow(ev.data);
+        if (ev.kind === 'connect' || ev.kind === 'disconnect') return connRow(ev.kind, ev.data);
+      } catch (e) { console.error('live feed row (' + ev.kind + ')', e); }
+      return null;
+    }
+
+    function redraw() {
+      feedList.textContent = '';
+      let shown = 0;
+      for (const ev of events) {
+        if (!passes(ev)) continue;
+        const row = rowFor(ev);
+        if (!row) continue;
+        feedList.append(row);
+        if (++shown >= DOM_CAP) break;
+      }
+      if (!shown) {
+        feedList.append(SW.ui.empty(
+          filters.length === FEED_KIND_VALUES.length
+            ? 'No live events yet — they appear here as they happen'
+            : 'No events match the active filters', 'live'));
+      }
+    }
+
+    /* cheap signature so the REST backfill does not duplicate events that
+     * already arrived over SSE between page open and fetch resolve */
+    function sigOf(ev) {
+      const d = ev.data || {};
+      let extra = '';
+      if (ev.kind === 'kill') {
+        extra = ((d.attacker && d.attacker.name) || '') + '>' + ((d.victim && d.victim.name) || '') + '|' + (d.weapon || '');
+      } else if (ev.kind === 'chat') {
+        extra = ((d.player && d.player.name) || '') + '|' + (d.message || '');
+      } else if (ev.kind === 'squad') {
+        extra = (d.type || '') + '|' + (d.teamId != null ? d.teamId : '') + ':' + (d.squadId != null ? d.squadId : '');
+      } else {
+        extra = d.name || (d.player && d.player.name) || '';
+      }
+      return ev.kind + '|' + ev.t + '|' + extra;
+    }
+
+    function addLive(kind, data) {
+      const ev = { t: num(data && data.time) || Date.now(), kind, data };
+      events.unshift(ev);
+      if (events.length > EV_CAP) events.pop();
+      if (paused) {
+        if (passes(ev)) { pending++; syncPause(); }
+        return;
+      }
+      if (!passes(ev)) return;
+      const row = rowFor(ev);
+      if (!row) return;
+      const emptyState = feedList.querySelector('.empty-state');
+      if (emptyState) emptyState.remove();
+      feedList.prepend(row);
+      while (feedList.children.length > DOM_CAP) feedList.lastChild.remove();
+    }
+
+    /* backfill, merged with anything SSE already delivered */
+    (async () => {
+      let r = null;
+      try { r = await SW.api('/api/live/feed?limit=120', { toast: false }); }
+      catch (_e) { redraw(); return; }
+      const seen = new Set(events.map(sigOf));
+      for (const row of (r && r.rows) || []) {
+        if (!row || !row.kind) continue;
+        const ev = { t: num(row.t) || num(row.data && row.data.time), kind: row.kind, data: row.data || {} };
+        if (seen.has(sigOf(ev))) continue;
+        events.push(ev);
+      }
+      events.sort((a, b) => b.t - a.t);
+      if (events.length > EV_CAP) events.length = EV_CAP;
+      redraw();
+    })();
+
+    /* ------------------------------------------------------- subscriptions */
+    unsubs.push(SW.live.on('players', () => { pruneOverlay(); scheduleRender(); }));
+    unsubs.push(SW.live.on('serverinfo', () => scheduleRender()));
+    unsubs.push(SW.live.on('match', () => scheduleRender()));
+    unsubs.push(SW.live.on('kill', (k) => {
+      if (!k) return;
+      addLive('kill', k);
+      if (k.kind !== 'wound') return;
+      if (k.attacker && !k.suicide) bump(k.attacker, 'sessKills');
+      if (k.victim) bump(k.victim, 'sessDeaths');
+      if (k.teamkill && k.attacker) bump(k.attacker, 'sessTks');
+      scheduleRender();
+    }));
+    unsubs.push(SW.live.on('chat', (c) => { if (c) addLive('chat', c); }));
+    unsubs.push(SW.live.on('connect', (d) => { if (d) { addLive('connect', d); scheduleRender(); } }));
+    unsubs.push(SW.live.on('disconnect', (d) => { if (d) { addLive('disconnect', d); scheduleRender(); } }));
+    unsubs.push(SW.live.on('squad', (s) => {
+      if (!s) return;
+      addLive('squad', s);
+      const key = (s.teamId != null ? s.teamId : 'null') + ':' + s.squadId;
+      if (s.type === 'created') {
+        overlay.set(key, {
+          createdAt: num(s.time) || Date.now(),
+          creatorName: s.creatorName != null ? s.creatorName : null,
+          creatorDbId: g(s, 'creatorDbId'),
+          name: s.name != null ? s.name : null,
+        });
+        // A teamed record supersedes an earlier team-unknown one for the
+        // same squad — never let the anon copy stamp anything later.
+        if (s.teamId != null) overlay.delete('null:' + s.squadId);
+      } else {
+        overlay.delete(key);
+        if (s.teamId != null) overlay.delete('null:' + s.squadId);
+      }
+      scheduleRender();
+    }));
+    // Map change dissolves every squad: stale creation overlays must never
+    // decorate the next match's same-numbered, same-named squads.
+    unsubs.push(SW.live.on('match', (m) => {
+      if (m && m.type === 'start') { overlay.clear(); scheduleRender(); }
+    }));
+
+    if (!SW.state.snapshot) SW.refreshOverview().then(() => { lastRender = Date.now(); renderRoster(); });
+    lastRender = Date.now();
+    renderRoster();
+  }
+
   /* ======================================================== route table */
 
   SW.routes.players = {
@@ -1590,6 +2170,12 @@
 
   SW.routes.trolls = {
     render(main, ctx) { renderTrolls.call(this, main, ctx); },
+    cleanup() {},
+  };
+
+  /* overrides the stage-1 live route registered by app.js (loaded earlier) */
+  SW.routes.live = {
+    render(main, ctx) { renderLive.call(this, main, ctx); },
     cleanup() {},
   };
 })();
