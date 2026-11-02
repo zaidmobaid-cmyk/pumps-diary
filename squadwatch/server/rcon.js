@@ -19,6 +19,12 @@ const SERVERDATA_AUTH = 3;           // client -> server
 const AUTH_ID = 1;              // fixed id for the auth request (commands use odd ids >= 3)
 const MIN_SIZE = 10;            // empty-body packet: id(4) + type(4) + 2 nulls
 const MAX_SIZE = 65536;         // anything outside [MIN_SIZE, MAX_SIZE] is a protocol desync
+
+// Real Squad servers answer an empty EXECCOMMAND (our multi-packet sentinel)
+// with TWO empty responses and then these seven raw bytes WITHOUT a packet
+// header (captured live 2026-11-02; same quirk SquadJS works around). Read
+// naively they become a garbage size field and desync the whole stream.
+const SQUAD_BROKEN_TRAILER = Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
 const BACKOFF_MIN_MS = 1000;    // reconnect backoff 1s, 2s, 4s, ... capped at 30s
 const BACKOFF_MAX_MS = 30000;
 const DIAL_TIMEOUT_MS = 15000;  // connect + auth must complete within this, else retry
@@ -171,7 +177,21 @@ class SquadRcon extends EventEmitter {
   _onData(chunk) {
     this._buf = this._buf.length === 0 ? chunk : Buffer.concat([this._buf, chunk]);
     // Drain every complete packet currently buffered; tolerate fragmentation & coalescing.
-    while (this._socket && !this._socket.destroyed && this._buf.length >= 4) {
+    while (this._socket && !this._socket.destroyed && this._buf.length >= 1) {
+      // Squad's headerless 7-byte trailer can sit at any packet boundary —
+      // swallow it before trying to read a header there. A legitimate header
+      // can never match all seven bytes: that would need size 256 with an id
+      // divisible by 2^24, and our ids are capped far below that.
+      if (this._buf[0] === 0x00) {
+        const n = Math.min(this._buf.length, SQUAD_BROKEN_TRAILER.length);
+        if (this._buf.subarray(0, n).equals(SQUAD_BROKEN_TRAILER.subarray(0, n))) {
+          if (this._buf.length < SQUAD_BROKEN_TRAILER.length) return; // trailer still arriving
+          this._buf = this._buf.length === SQUAD_BROKEN_TRAILER.length
+            ? EMPTY : this._buf.subarray(SQUAD_BROKEN_TRAILER.length);
+          continue;
+        }
+      }
+      if (this._buf.length < 4) return;
       const size = this._buf.readInt32LE(0);
       if (size < MIN_SIZE || size > MAX_SIZE) {
         this._desync(`bad packet size ${size}`);
@@ -250,7 +270,9 @@ class SquadRcon extends EventEmitter {
     const job = this._queue.shift();
     const id = this._nextId;
     this._nextId += 2;
-    if (this._nextId > 0x3ffffff0) this._nextId = 3; // stay well inside int32, keep ids odd
+    // Cap below 2^24 so no id is ever divisible by 2^24 — that keeps a real
+    // header from ever matching the Squad broken-trailer byte pattern.
+    if (this._nextId > 0xfffff0) this._nextId = 3; // keep ids odd
     const inf = {
       id,
       sentinelId: id + 1,

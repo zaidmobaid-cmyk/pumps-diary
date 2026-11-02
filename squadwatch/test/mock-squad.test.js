@@ -52,6 +52,16 @@ class TinyRcon {
 
   _drain() {
     while (this.buf.length >= 4) {
+      // The mock mirrors real Squad: an empty exec is answered by two empty
+      // responses plus seven headerless bytes — skip that trailer like
+      // server/rcon.js does.
+      if (this.buf[0] === 0x00 && this.buf[1] === 0x01) {
+        if (this.buf.length < 7) return;
+        if (this.buf.slice(0, 7).equals(Buffer.from([0, 1, 0, 0, 0, 0, 0]))) {
+          this.buf = this.buf.slice(7);
+          continue;
+        }
+      }
       const size = this.buf.readInt32LE(0);
       if (this.buf.length < size + 4) return;
       const id = this.buf.readInt32LE(4);

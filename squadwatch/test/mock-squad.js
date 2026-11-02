@@ -207,8 +207,13 @@ class MockSquad extends EventEmitter {
     if (pkt.type === T_EXEC) {
       if (!st.authed) return; // unauthenticated exec is ignored
       if (pkt.body === '') {
-        // multi-packet sentinel: echo an empty response with the same id
+        // Real Squad answers the multi-packet sentinel with TWO empty
+        // responses and then seven raw bytes WITHOUT a packet header
+        // (captured live 2026-11-02) — mirror that so the client's
+        // broken-trailer handling is exercised by every test.
         this._sendPacket(sock, pkt.id, T_RESPONSE, '');
+        this._sendPacket(sock, pkt.id, T_RESPONSE, '');
+        try { sock.write(Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])); } catch (_e) { /* */ }
         return;
       }
       const raw = pkt.body;
