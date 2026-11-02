@@ -493,13 +493,17 @@ test('ingest pipeline: scripted parsed events through a real temp db', async (t)
       'INSERT INTO bans(player_id, steam_id, issued_by, issued_at, duration_sec, expires_at, reason, interval_raw, active, rcon_ok) VALUES(?,?,?,?,?,?,?,?,?,?)'
     ).run(dbId(EOS_D), STEAM_D, null, T5, 0, null, 'intentional teamkilling', '0', 1, 1);
 
-    assert.equal(w.admin.calls.filter((c) => c.action === 'kick').length, 0);
+    // Enforcement sends an exact RCON kick audited as 'ban-enforce'.
+    const enforced = () => w.admin.calls.filter((c) => c.action === 'raw' && c.params.meta && c.params.meta.action === 'ban-enforce');
+    assert.equal(enforced().length, 0);
     L({ event: 'PLAYER_CONNECTED', time: T5 + 10 * SEC, raw: '', controller: 'BP_PlayerController_C_1005', ip: '10.0.0.4', eosId: EOS_D, steamId: STEAM_D });
-    const kicks = w.admin.calls.filter((c) => c.action === 'kick');
+    const kicks = enforced();
     assert.equal(kicks.length, 1);
     assert.equal(kicks[0].user, null, 'system action: user NULL');
-    assert.equal(kicks[0].params.playerId, dbId(EOS_D));
-    assert.match(kicks[0].params.reason, /^Banned: intentional teamkilling \(until perm\)$/);
+    assert.equal(kicks[0].params.meta.targetPlayerId, dbId(EOS_D));
+    // The log path selects by SteamID: the stored in-game id may belong to the
+    // player's previous connection.
+    assert.equal(kicks[0].params.command, `AdminKick ${STEAM_D} Banned: intentional teamkilling (until perm)`);
 
     // An EXPIRED ban must not kick.
     connect(T5 + 20 * SEC, EOS_E, STEAM_E, 'BP_PlayerController_C_1006', '10.0.0.5', 'Echo');
@@ -508,7 +512,7 @@ test('ingest pipeline: scripted parsed events through a real temp db', async (t)
       'INSERT INTO bans(player_id, steam_id, issued_by, issued_at, duration_sec, expires_at, reason, interval_raw, active, rcon_ok) VALUES(?,?,?,?,?,?,?,?,?,?)'
     ).run(dbId(EOS_E), STEAM_E, null, T5 - 86400000, 3600, T5, 'expired ban', '1h', 1, 1);
     L({ event: 'PLAYER_CONNECTED', time: T5 + 30 * SEC, raw: '', controller: 'BP_PlayerController_C_1007', ip: '10.0.0.5', eosId: EOS_E, steamId: STEAM_E });
-    assert.equal(w.admin.calls.filter((c) => c.action === 'kick').length, 1, 'expired ban did not kick');
+    assert.equal(enforced().length, 1, 'expired ban did not kick');
   });
 
   const T6 = T5 + 2 * MIN;

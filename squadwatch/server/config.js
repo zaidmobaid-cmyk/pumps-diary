@@ -36,6 +36,20 @@ function defaults() {
     autoWarnTeamkiller: false,
     autoWarnMessage: 'Teamkill detected: {victim}. TKs are logged. Apologize in all-chat.',
     retention: { chatDays: 0, popDays: 30 },
+    // docs/NEXT-CONTRACTS.md §3 — BattleMetrics ban-list import.
+    battlemetrics: { token: '', banListId: '', autoSync: false, syncHours: 6 },
+    // docs/BATCH3-CONTRACTS.md — evidence uploads, Squad remote ban list,
+    // in-game admin calls, join alerts.
+    evidence: { maxMB: 50 },
+    remoteBanList: { enabled: false, key: '', includeEos: false },
+    adminCalls: {
+      enabled: true,
+      triggers: ['!admin'],
+      discordRoleId: '',
+      reply: 'Admins have been notified - hang tight.',
+      cooldownSec: 60,
+    },
+    joinAlerts: { watchlist: true, flagged: true, banEvasion: true, autoKickEvasion: false },
     demo: false,
     logUnparsed: false,
   };
@@ -58,6 +72,23 @@ const isSecureCookies = (v) => (v === 'auto' || typeof v === 'boolean' ? null : 
 const isMode = (v) => (v === 'local' || v === 'ftp' || v === 'sftp' ? null : 'expected "local", "ftp" or "sftp"');
 const isStringArray = (v) =>
   (Array.isArray(v) && v.every((x) => typeof x === 'string') ? null : 'expected array of strings');
+// Cloudflare's free plan caps a request body at 100 MB.
+const isEvidenceMB = (v) => (Number.isInteger(v) && v >= 1 && v <= 100 ? null : 'expected integer 1-100');
+// '' = not generated yet; otherwise a URL-safe random key.
+const isRemoteKey = (v) =>
+  (typeof v === 'string' && (v === '' || /^[A-Za-z0-9_-]{24,128}$/.test(v)) ? null : 'expected empty or a 24-128 character URL-safe key');
+const isDiscordRoleId = (v) =>
+  (typeof v === 'string' && (v === '' || /^\d{5,25}$/.test(v)) ? null : 'expected a Discord role id (digits) or empty');
+// BattleMetrics ban-list ids are UUIDs; '' = none chosen yet.
+const isBanListId = (v) =>
+  (typeof v === 'string' && /^[A-Za-z0-9-]{0,64}$/.test(v) ? null : 'expected a BattleMetrics ban list id (UUID) or ""');
+const isSyncHours = (v) => (Number.isInteger(v) && v >= 1 && v <= 168 ? null : 'expected integer 1-168');
+// Absent in real configs: only tests point the import at a mock API.
+const isOptionalHttpUrl = (v) =>
+  (v === undefined || (typeof v === 'string' && /^https?:\/\/[^\s/?#]+[^\s]*$/.test(v)) ? null : 'expected an http(s) URL');
+// This game server's id on BattleMetrics (digits; absent or "" = unknown).
+const isOptionalBmServerId = (v) =>
+  (v === undefined || (typeof v === 'string' && /^\d{0,12}$/.test(v)) ? null : 'expected a BattleMetrics server id (digits, as a string) or ""');
 
 // Mirrors the defaults tree; leaves are checker functions.
 const SCHEMA = {
@@ -88,6 +119,26 @@ const SCHEMA = {
   autoWarnTeamkiller: isBool,
   autoWarnMessage: isString,
   retention: { chatDays: isNonNegInt, popDays: isNonNegInt },
+  battlemetrics: {
+    token: isString,
+    banListId: isBanListId,
+    autoSync: isBool,
+    syncHours: isSyncHours,
+    apiBase: isOptionalHttpUrl, // file-only test hook, never in SETTINGS_ALLOW
+    // File-only: set, server-only (orgWide false) bans for other BM servers
+    // are not enforced here.
+    serverId: isOptionalBmServerId,
+  },
+  evidence: { maxMB: isEvidenceMB },
+  remoteBanList: { enabled: isBool, key: isRemoteKey, includeEos: isBool },
+  adminCalls: {
+    enabled: isBool,
+    triggers: isStringArray,
+    discordRoleId: isDiscordRoleId,
+    reply: isString,
+    cooldownSec: isNonNegInt,
+  },
+  joinAlerts: { watchlist: isBool, flagged: isBool, banEvasion: isBool, autoKickEvasion: isBool },
   demo: isBool,
   logUnparsed: isBool,
 };
@@ -95,6 +146,7 @@ const SCHEMA = {
 // §19.3.27 — never echo these values, even in validation errors.
 const SECRET_PATHS = new Set([
   'squad.rconPassword', 'log.ftp.password', 'log.sftp.password', 'steamApiKey', 'discordWebhook',
+  'battlemetrics.token', 'remoteBanList.key',
 ]);
 
 function show(v) {
@@ -156,7 +208,7 @@ function loadConfig(configPath) {
     try {
       user = JSON.parse(text);
     } catch (e) {
-      throw new Error(`config: ${file} is not valid JSON: ${e.message}`);
+      throw new Error(`config: ${file} is not valid JSON (${describeReadError(e)})`);
     }
     if (!isPlainObject(user)) {
       throw new Error(`config: ${file} must contain a JSON object`);
@@ -200,6 +252,11 @@ const SETTINGS_ALLOW = [
   'flags.tkSpreeCount', 'flags.tkSpreeWindowSec', 'flags.massTkCount', 'flags.newPlayerMinutes', 'flags.chatWatchlist',
   'autoWarnTeamkiller', 'autoWarnMessage',
   'retention.chatDays', 'retention.popDays',
+  'battlemetrics.token', 'battlemetrics.banListId', 'battlemetrics.autoSync', 'battlemetrics.syncHours',
+  'evidence.maxMB',
+  'remoteBanList.enabled', 'remoteBanList.key', 'remoteBanList.includeEos',
+  'adminCalls.enabled', 'adminCalls.triggers', 'adminCalls.discordRoleId', 'adminCalls.reply', 'adminCalls.cooldownSec',
+  'joinAlerts.watchlist', 'joinAlerts.flagged', 'joinAlerts.banEvasion', 'joinAlerts.autoKickEvasion',
 ];
 
 function getLeaf(obj, dotted) {
@@ -266,6 +323,17 @@ function applySettingsPatch(cfg, patch) {
  * the sparse user config.json (created if missing), written atomically
  * (tmp + rename) with pretty JSON so hand-editing stays pleasant.
  */
+// V8's JSON errors quote the file around the fault, and the file holds
+// passwords: report only where it broke. This text reaches logs and API
+// answers.
+function describeReadError(e) {
+  if (e && typeof e.code === 'string') return e.code;
+  const at = /position (\d+)(?: \(line (\d+) column (\d+)\))?/.exec(String(e && e.message));
+  if (at && at[2]) return `syntax error at line ${at[2]}, column ${at[3]}`;
+  if (at) return `syntax error at position ${at[1]}`;
+  return 'syntax error';
+}
+
 function persistUserConfig(configPath, changedPaths, cfg) {
   const file = configPath || 'config.json';
   let user = {};
@@ -279,7 +347,7 @@ function persistUserConfig(configPath, changedPaths, cfg) {
     try {
       parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (e) {
-      throw new Error(`config.json is unreadable or not valid JSON (${e.message}) — fix it by hand; the change was applied live but NOT saved`);
+      throw new Error(`config.json is unreadable or not valid JSON (${describeReadError(e)}) — fix it by hand; the change was applied live but NOT saved`);
     }
     if (!isPlainObject(parsed)) {
       throw new Error('config.json does not contain a JSON object — fix it by hand; the change was applied live but NOT saved');
@@ -301,4 +369,8 @@ function persistUserConfig(configPath, changedPaths, cfg) {
   }
 }
 
-module.exports = { loadConfig, applySettingsPatch, persistUserConfig, SETTINGS_ALLOW };
+// What an audit row records for a save persistUserConfig failed: roles
+// without `settings` read the audit log, and the error names local paths.
+const NOT_SAVED = 'config.json not written — see the panel log';
+
+module.exports = { loadConfig, applySettingsPatch, persistUserConfig, SETTINGS_ALLOW, NOT_SAVED };

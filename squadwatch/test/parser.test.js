@@ -386,23 +386,23 @@ test('parseServerInfo tolerates missing keys (nulls) and rejects bad JSON', () =
   assert.equal(parser.parseServerInfo('null'), null);
 });
 
-test('parseLayers skips the header line, trims, drops empties, keeps mod suffixes', () => {
+test('parseLayers skips the header line, trims, drops empties, strips " (mod)" suffixes', () => {
   const out = parser.parseLayers(
     'List of available layers :\nAlbasrah_AAS_v1\n  Belaya_RAAS_v1 (CAF Mod)  \n\nYehorivka_RAAS_v1\n'
   );
-  assert.deepEqual(out, ['Albasrah_AAS_v1', 'Belaya_RAAS_v1 (CAF Mod)', 'Yehorivka_RAAS_v1']);
+  assert.deepEqual(out, ['Albasrah_AAS_v1', 'Belaya_RAAS_v1', 'Yehorivka_RAAS_v1']);
   assert.deepEqual(parser.parseLayers('List of available layers :'), []);
 });
 
 test('parseCurrentMap / parseNextMap incl. "To be voted" and empty values', () => {
   assert.deepEqual(parser.parseCurrentMap('Current level is Yehorivka, layer is Yehorivka RAAS v1'),
-    { level: 'Yehorivka', layer: 'Yehorivka RAAS v1' });
+    { level: 'Yehorivka', layer: 'Yehorivka RAAS v1', team1: null, team2: null });
   assert.deepEqual(parser.parseNextMap('Next level is Gorodok, layer is Gorodok RAAS v1'),
-    { level: 'Gorodok', layer: 'Gorodok RAAS v1' });
+    { level: 'Gorodok', layer: 'Gorodok RAAS v1', team1: null, team2: null });
   assert.deepEqual(parser.parseNextMap('Next level is To be voted, layer is To be voted'),
-    { level: null, layer: null });
+    { level: null, layer: null, team1: null, team2: null });
   assert.deepEqual(parser.parseNextMap('Next level is , layer is '),
-    { level: null, layer: null });
+    { level: null, layer: null, team1: null, team2: null });
   assert.equal(parser.parseCurrentMap('Next level is X, layer is Y'), null);
   assert.equal(parser.parseCurrentMap('garbage'), null);
 });

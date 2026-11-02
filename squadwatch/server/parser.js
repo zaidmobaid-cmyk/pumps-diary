@@ -352,17 +352,115 @@ function parseServerInfo(jsonText) {
 }
 
 // ---------------------------------------------------------------------------
-// ListLayers (§6.4): skip the header line, one layer per line, trim, drop
-// empties; `(…)` mod suffixes are kept as-is.
+// ListLayers (§6.4 amended by docs/NEXT-CONTRACTS.md §1): skip the header
+// line, one layer per line, trim, drop empties. Modded entries carry the
+// workshop id as a " (modid)" suffix — `SU_Sumari_Seed_v1 (3293347373)` — and
+// the real layer name (the one AdminChangeLayer takes) is the part before it.
+// Names are de-duplicated case-insensitively, first spelling wins, so a
+// case-insensitive lookup against the list can never be ambiguous.
 // ---------------------------------------------------------------------------
-function parseLayers(text) {
+
+// String scan, not a regex: a backtracking pattern over a whitespace-heavy
+// 64KiB line is quadratic.
+function splitLayerName(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s.endsWith(')')) return { name: s, modId: null };
+  const open = s.lastIndexOf('(');
+  // " (" exactly as the server prints it; "Foo(1)" is a name, not a suffix.
+  if (open < 1 || !/\s/.test(s[open - 1])) return { name: s, modId: null };
+  const inner = s.slice(open + 1, -1);
+  const name = s.slice(0, open).trim();
+  if (!name || inner.includes(')')) return { name: s, modId: null };
+  return { name, modId: inner.trim() || null };
+}
+
+function parseLayerList(text) {
+  const out = [];
+  const seen = new Set();
   const lines = String(text == null ? '' : text).split(/\r?\n/);
-  return lines.slice(1).map((l) => l.trim()).filter((l) => l.length > 0);
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const entry = splitLayerName(lines[i]);
+    const key = entry.name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
+function parseLayers(text) {
+  return parseLayerList(text).map((e) => e.name);
+}
+
+// Game-mode tokens as they appear inside layer names. Unknown (modded) modes
+// are still found as the token right before a `vN` version token.
+const LAYER_MODES = new Set([
+  'aas', 'raas', 'invasion', 'tc', 'insurgency', 'destruction', 'skirmish',
+  'seed', 'tanks', 'training', 'ta', 'fraas',
+]);
+const LAYER_VERSION_RE = /^v\d+[a-z]?$/i;
+// A short all-caps lead token before the level (`SU_`, `CAF_`) is a mod tag.
+const LAYER_PREFIX_RE = /^[A-Z0-9]{2,5}$/;
+
+// Best-effort {name, modId, level, mode, mod} for one stripped layer name:
+// SU_Sumari_Seed_v1 + '3293347373' -> level 'Sumari', mode 'Seed', mod true.
+// level/mode are display data only (never sent to RCON): a multi-word level
+// reads 'Fools Road'; mode is null when the name does not follow
+// Level_Mode_vN.
+function layerInfo(name, modId) {
+  const n = String(name == null ? '' : name);
+  const toks = n.split('_').filter(Boolean);
+  let mi = -1;
+  for (let i = 1; i < toks.length; i++) {
+    if (LAYER_MODES.has(toks[i].toLowerCase())) { mi = i; break; }
+  }
+  if (mi < 0) {
+    for (let i = 2; i < toks.length; i++) {
+      if (LAYER_VERSION_RE.test(toks[i])) { mi = i - 1; break; }
+    }
+  }
+  let lv = mi > 0 ? toks.slice(0, mi) : toks.slice(0, Math.min(2, toks.length));
+  if (lv.length > 1 && LAYER_PREFIX_RE.test(lv[0])) lv = lv.slice(1);
+  if (mi < 0) lv = lv.slice(0, 1);
+  const id = modId == null || modId === '' ? null : String(modId);
+  return {
+    name: n,
+    modId: id,
+    level: lv.length ? lv.join(' ') : null,
+    mode: mi > 0 ? toks[mi] : null,
+    mod: id != null,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// ShowCurrentMap / ShowNextMap (§6.4). "To be voted" / empty → nulls.
-// Tolerates a trailing ", factions …" suffix some game versions append.
+// Factions (docs/NEXT-CONTRACTS.md §1): `Faction+Type` tokens as RCON prints
+// and takes them (`SU_IDF+Combined`); the `+Type` half is optional.
+// ---------------------------------------------------------------------------
+const FACTION_TOKEN_RE = /^[A-Za-z0-9_]{1,48}(\+[A-Za-z0-9_]{1,48})?$/;
+
+// "SU_IDF+Combined SU_PALINS" -> {team1, team2}; anything but exactly two
+// valid tokens -> both null (never half a pairing).
+function parseFactionPair(text) {
+  const toks = String(text == null ? '' : text).trim().split(/\s+/).filter(Boolean);
+  if (toks.length !== 2 || !FACTION_TOKEN_RE.test(toks[0]) || !FACTION_TOKEN_RE.test(toks[1])) {
+    return { team1: null, team2: null };
+  }
+  return { team1: toks[0], team2: toks[1] };
+}
+
+// "SU_IDF+Combined" -> {code:'SU_IDF', type:'Combined'}; "SU_PALINS" -> type null.
+function splitFaction(token) {
+  const s = String(token == null ? '' : token);
+  const i = s.indexOf('+');
+  if (i < 0) return { code: s, type: null };
+  return { code: s.slice(0, i), type: s.slice(i + 1) || null };
+}
+
+// ---------------------------------------------------------------------------
+// ShowCurrentMap / ShowNextMap (§6.4). "To be voted" / empty → nulls. The
+// ", factions A B" suffix becomes team1/team2 (null when absent or not a
+// valid pair); a " (modid)" suffix on the layer is stripped like ListLayers'.
 // ---------------------------------------------------------------------------
 function mapFieldValue(v) {
   const s = String(v == null ? '' : v).trim();
@@ -370,18 +468,27 @@ function mapFieldValue(v) {
   return s;
 }
 
-function parseCurrentMap(text) {
-  // The space before each value is optional: when the value is empty the
-  // trailing space is often trimmed away with it.
-  const m = /^Current level is ?(.*?), layer is ?(.*?)(?:, factions .*)?$/.exec(String(text == null ? '' : text).trim());
+function mapLine(re, text) {
+  const m = re.exec(String(text == null ? '' : text).trim());
   if (!m) return null;
-  return { level: mapFieldValue(m[1]), layer: mapFieldValue(m[2]) };
+  const layer = mapFieldValue(m[2]);
+  const pair = parseFactionPair(m[3]);
+  return {
+    level: mapFieldValue(m[1]),
+    layer: layer == null ? null : splitLayerName(layer).name,
+    team1: pair.team1,
+    team2: pair.team2,
+  };
+}
+
+// The space before each value is optional: when the value is empty the
+// trailing space is often trimmed away with it.
+function parseCurrentMap(text) {
+  return mapLine(/^Current level is ?(.*?), layer is ?(.*?)(?:, factions ?(.*))?$/, text);
 }
 
 function parseNextMap(text) {
-  const m = /^Next level is ?(.*?), layer is ?(.*?)(?:, factions .*)?$/.exec(String(text == null ? '' : text).trim());
-  if (!m) return null;
-  return { level: mapFieldValue(m[1]), layer: mapFieldValue(m[2]) };
+  return mapLine(/^Next level is ?(.*?), layer is ?(.*?)(?:, factions ?(.*))?$/, text);
 }
 
 module.exports = {
@@ -391,8 +498,14 @@ module.exports = {
   parseListSquads,
   parseServerInfo,
   parseLayers,
+  parseLayerList,
+  splitLayerName,
+  layerInfo,
   parseCurrentMap,
   parseNextMap,
+  parseFactionPair,
+  splitFaction,
+  FACTION_TOKEN_RE,
   parseOnlineIds,
   parseLogTime,
 };

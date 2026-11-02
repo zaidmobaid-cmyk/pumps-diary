@@ -40,14 +40,14 @@ test('v2 migration on a fresh db seeds builtin roles and rebuilds users onto rol
 
 // -------------------------------------------------------------- legacy names
 
-test('builtin role names still resolve: createUser/verifyLogin expose the NAME', () => {
+test('builtin role names still resolve: createUser/verifyLogin expose the NAME', async () => {
   const { auth } = freshAuth();
   for (const name of ['owner', 'admin', 'viewer']) {
     const u = auth.createUser(`u-${name}`, 'pw123456', name);
     assert.strictEqual(u.role, name, 'user.role carries the role name, not the id');
     assert.strictEqual(u.roleId, auth.roleRow(name).id);
   }
-  const ok = auth.verifyLogin('u-admin', 'pw123456');
+  const ok = await auth.verifyLogin('u-admin', 'pw123456');
   assert.ok(ok);
   assert.strictEqual(ok.role, 'admin');
   assert.deepStrictEqual(ok.perms, sanitizePerms(builtinRolePerms('admin')),

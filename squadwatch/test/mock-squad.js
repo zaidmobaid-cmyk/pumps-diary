@@ -114,7 +114,7 @@ class MockSquad extends EventEmitter {
     this.current = this._layerInfo(o.currentLayer || this.layers[0]);
     this.next = this._layerInfo(o.nextLayer || this.layers[1]);
     this.tickRate = 40.0;
-    this.serverName = o.serverName || 'SquadWatch Mock Server';
+    this.serverName = o.serverName || 'A3 Demo Server';
     this.maxPlayers = o.maxPlayers || 100;
     this.matchStartedAt = Date.now();
 
@@ -543,10 +543,12 @@ class MockSquad extends EventEmitter {
       case 'showserverinfo': return this._renderServerInfo();
       case 'listlayers': return 'List of available layers :\n' + this.layers.join('\n');
       case 'showcurrentmap':
-        return 'Current level is ' + this.current.level + ', layer is ' + this.current.layer;
+        return 'Current level is ' + this.current.level + ', layer is ' + this.current.layer +
+          (this.current.factions ? ', factions ' + this.current.factions.join(' ') : '');
       case 'shownextmap':
         return this.next
-          ? 'Next level is ' + this.next.level + ', layer is ' + this.next.layer
+          ? 'Next level is ' + this.next.level + ', layer is ' + this.next.layer +
+            (this.next.factions ? ', factions ' + this.next.factions.join(' ') : '')
           : 'Next level is , layer is To be voted';
       case 'listcommands': return this._renderListCommands();
       case 'adminbroadcast': return this._cmdBroadcast(rest);
@@ -681,16 +683,23 @@ class MockSquad extends EventEmitter {
     return 'Message broadcasted';
   }
 
+  // Real Squad syntax: "<LayerName Faction1+Type Faction2+Type>" — the two
+  // factions are optional but come as a pair.
   _cmdChangeLayer(arg, now) {
-    const want = String(arg).trim().replace(/ /g, '_');
-    const hit = this.layers.find((l) => l.toLowerCase() === want.toLowerCase());
-    if (!hit) return 'Layer name invalid, check ListLayers for the list of valid layers';
+    const parts = String(arg).trim().split(/\s+/).filter(Boolean);
+    const invalid = 'Layer name invalid, check ListLayers for the list of valid layers';
+    if (parts.length !== 1 && parts.length !== 3) return invalid;
+    const hit = this.layers.find((l) => l.toLowerCase() === parts[0].toLowerCase());
+    if (!hit) return invalid;
+    const factions = parts.length === 3 ? [parts[1], parts[2]] : null;
+    const suffix = factions ? ' ' + factions.join(' ') : '';
     if (now) {
       this.newGame(hit);
-      return 'Changed layer to ' + hit;
+      this.current.factions = factions;
+      return 'Changed layer to ' + hit + suffix;
     }
-    this.next = this._layerInfo(hit);
-    return 'Set next layer to ' + hit;
+    this.next = Object.assign(this._layerInfo(hit), { factions });
+    return 'Set next layer to ' + hit + suffix;
   }
 
   _cmdKick(rest, byId) {

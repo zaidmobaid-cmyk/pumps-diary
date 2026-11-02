@@ -16,6 +16,77 @@ function getFactions() {
 const NAME_MAX = 64;
 const CHAT_MAX = 480;
 
+// Roster-diff sessions vs log lines (see "roster sessions" below): a log line
+// within LINK_WINDOW_MS of the roster's view of a connection is that same
+// connection. CLOCK_SLACK_MS absorbs game-server vs panel clock drift.
+// Unsettled links are dropped after LINK_TTL_MS (wall clock).
+const LINK_WINDOW_MS = 5 * 60 * 1000;
+const CLOCK_SLACK_MS = 60 * 1000;
+const LINK_TTL_MS = 30 * 60 * 1000;
+// A panel restart shorter than this is a blip: a player boot recovery closed
+// who is online again right after played through it.
+const RESUME_MS = 10 * 60 * 1000;
+// Cap on remembered quiet closes (see _noteQuietClose).
+const QUIET_MAX = 5000;
+
+// Ban enforcement (docs/NEXT-CONTRACTS.md §3): a banned player is kicked at
+// most once per BAN_KICK_GAP_MS whichever path saw them — a log connect and
+// the roster report the same connection. Every roster poll re-checks who is
+// online, so a reconnect inside the gap is kicked once it has passed.
+const BAN_KICK_GAP_MS = 60 * 1000;
+// Leaves room for "(until …)" inside execRaw's 480-character command cap.
+const KICK_REASON_MAX = 300;
+// Exact kick selectors only (admin.js patterns): an in-game id, else a
+// SteamID. A name could match another player.
+const GAME_ID_RE = /^\d{1,6}$/;
+const STEAM_ID_RE = /^7656\d{13}$/;
+
+// "3d 4h" / "4h 12m" / "12m" — BattleMetrics' {{timeLeft}} in imported reasons.
+function banTimeLeft(expiresAt, now) {
+  if (expiresAt == null) return 'permanent';
+  const mins = Math.max(0, Math.ceil((Number(expiresAt) - now) / 60000));
+  const dd = Math.floor(mins / 1440);
+  const hh = Math.floor((mins % 1440) / 60);
+  const mm = mins % 60;
+  if (dd) return hh ? `${dd}d ${hh}h` : `${dd}d`;
+  if (hh) return mm ? `${hh}h ${mm}m` : `${hh}h`;
+  return `${mm}m`;
+}
+
+// The message a banned player is kicked with. Imported reasons may hold BM
+// template tokens. A trailing [..] is stripped as a staff-only BM note;
+// battlemetrics.js keeps real reasons clear of brackets and the note itself
+// in bans.note, which never reaches the player.
+function banKickText(ban, now) {
+  let reason = String(ban.reason == null ? '' : ban.reason);
+  if (ban.source === 'battlemetrics') {
+    reason = reason.replace(/\s*\[[^[\]]*\]\s*$/, '')
+      .replace(/\{\{\s*timeLeft\s*\}\}/gi, banTimeLeft(ban.expires_at, now))
+      .replace(/\{\{[^{}]*\}\}/g, '');
+  }
+  reason = reason.replace(/\s+/g, ' ').trim().slice(0, KICK_REASON_MAX);
+  const until = ban.expires_at != null ? new Date(Number(ban.expires_at)).toISOString().slice(0, 10) : 'perm';
+  return `Banned: ${reason || 'no reason recorded'} (until ${until})`;
+}
+
+// Which ban a player is shown when several match: permanent first, then the
+// latest expiry, then the newest.
+function outranks(a, b) {
+  const ap = a.expires_at == null;
+  const bp = b.expires_at == null;
+  if (ap !== bp) return ap;
+  if (!ap && Number(a.expires_at) !== Number(b.expires_at)) return Number(a.expires_at) > Number(b.expires_at);
+  return Number(a.id) > Number(b.id);
+}
+
+// play_seconds credit for a session span — the one formula every open/close/
+// re-time uses, so corrections move the total by exact differences.
+function creditSecs(start, end) {
+  const s = Number(start) || 0;
+  const e = Math.max(s, Number(end) || 0);
+  return Math.max(0, Math.round((e - s) / 1000));
+}
+
 // Tolerant Online-IDs scanner (§6.1) for the raw ids blobs that ride inside
 // wound/die/damage/revive events.
 const IDS_RE = /\b(EOS|steam):\s*([0-9a-f]{32}|\d{17})/gi;
@@ -82,6 +153,11 @@ class Ingest {
     this.watchlist = compileWatchlist(this.config.flags && this.config.flags.chatWatchlist);
     this.popTimer = null;
     this.retentionTimer = null;
+    this._bootClosed = new Map(); // player db id -> {sessionId, connectAt, closedAt} closed by boot recovery
+    this._bootResume = null; // null | 'baseline' | 'next' — see onRosterBaseline
+    this._quietClosed = new Set(); // session ids closed without announcing a leave
+    this._rosterLinks = new Map(); // eosId -> [link] (see "roster sessions")
+    this._banKicks = new Map(); // eosId (or #dbId) -> wall time of its last ban-enforce kick
 
     this._closeDanglingSessionsAtBoot();
     this._resumeOpenMatch();
@@ -97,6 +173,21 @@ class Ingest {
       this.bus.on('serverinfo-updated', this._onInfo);
       this.bus.on('players-updated', this._onPlayers);
       this.bus.on('squad-disbanded', this._onSquadGone);
+    }
+    // Roster-diff joins/leaves come straight from live state: index.js
+    // bridges only a few state events onto the bus. State's own
+    // 'players-updated' closes each poll, after that poll's roster-* events.
+    if (this.state && typeof this.state.on === 'function') {
+      this._onRosterJoined = (ev) => this.onRosterJoined(ev);
+      this._onRosterLeft = (ev) => this.onRosterLeft(ev);
+      this._onRosterBaseline = (ev) => this.onRosterBaseline(ev);
+      this._onRosterPolled = () => this.onRosterPolled();
+      this._onBanSweep = () => this.sweepBans();
+      this.state.on('roster-joined', this._onRosterJoined);
+      this.state.on('roster-left', this._onRosterLeft);
+      this.state.on('roster-baseline', this._onRosterBaseline);
+      this.state.on('players-updated', this._onRosterPolled);
+      this.state.on('players-updated', this._onBanSweep);
     }
     // SQUAD_CREATED cross-source dedupe: the same creation arrives via the
     // RCON chat packet AND the log line when both sources are connected. Keyed
@@ -128,11 +219,22 @@ class Ingest {
           WHERE s.disconnect_at IS NULL`
       ).all();
       if (!rows.length) return;
+      const closed = [];
       this.db.tx(() => {
         for (const r of rows) {
-          this.closeSession(r.id, r.player_id, r.connect_at, Math.max(Number(r.connect_at) || 0, Number(r.last_seen) || 0));
+          const end = Math.max(Number(r.connect_at) || 0, Number(r.last_seen) || 0);
+          this.closeSession(r.id, r.player_id, r.connect_at, end);
+          closed.push({ sessionId: Number(r.id), playerId: r.player_id, connectAt: Number(r.connect_at) || 0, closedAt: end });
         }
       });
+      // Resume candidates: the first roster after boot may find these players
+      // still online (onRosterBaseline).
+      for (const c of closed) {
+        this._noteQuietClose(c.sessionId);
+        if (c.playerId == null) continue;
+        const prev = this._bootClosed.get(Number(c.playerId));
+        if (!prev || c.connectAt >= prev.connectAt) this._bootClosed.set(Number(c.playerId), c);
+      }
       log.info('ingest', `closed ${rows.length} dangling session(s) at boot (crash recovery)`);
     } catch (e) {
       log.error('ingest', `boot session cleanup failed: ${e.message}`);
@@ -188,6 +290,13 @@ class Ingest {
       if (this._onInfo) this.bus.removeListener('serverinfo-updated', this._onInfo);
       if (this._onPlayers) this.bus.removeListener('players-updated', this._onPlayers);
       if (this._onSquadGone) this.bus.removeListener('squad-disbanded', this._onSquadGone);
+    }
+    if (this.state && typeof this.state.removeListener === 'function') {
+      if (this._onRosterJoined) this.state.removeListener('roster-joined', this._onRosterJoined);
+      if (this._onRosterLeft) this.state.removeListener('roster-left', this._onRosterLeft);
+      if (this._onRosterBaseline) this.state.removeListener('roster-baseline', this._onRosterBaseline);
+      if (this._onRosterPolled) this.state.removeListener('players-updated', this._onRosterPolled);
+      if (this._onBanSweep) this.state.removeListener('players-updated', this._onBanSweep);
     }
   }
 
@@ -455,9 +564,31 @@ class Ingest {
     const start = Number(connectAt) || 0;
     const end = Math.max(start, Number(disconnectAt) || 0);
     this.stmt('UPDATE sessions SET disconnect_at=? WHERE id=?').run(end, sessionId);
-    const secs = Math.max(0, Math.round((end - start) / 1000));
+    const secs = creditSecs(start, end);
     if (secs > 0 && playerId != null) {
       this.stmt('UPDATE players SET play_seconds=play_seconds+? WHERE id=?').run(secs, playerId);
+    }
+  }
+
+  _openSessions(playerId) {
+    return this.stmt('SELECT id, connect_at FROM sessions WHERE player_id=? AND disconnect_at IS NULL ORDER BY id').all(playerId);
+  }
+
+  // Applies the difference a re-timed closed session makes to play_seconds.
+  _recredit(playerId, deltaSecs) {
+    if (!deltaSecs || playerId == null) return;
+    this.stmt('UPDATE players SET play_seconds=MAX(0, play_seconds+?) WHERE id=?').run(deltaSecs, playerId);
+  }
+
+  // A session this process closed without announcing a leave (boot recovery,
+  // a missed disconnect): its disconnect line, if a log backlog still holds
+  // one, is news (_settleClosedLeave). Oldest forgotten first.
+  _noteQuietClose(sessionId) {
+    this._quietClosed.add(sessionId);
+    if (this._quietClosed.size <= QUIET_MAX) return;
+    for (const id of this._quietClosed) {
+      this._quietClosed.delete(id);
+      if (this._quietClosed.size <= QUIET_MAX / 2) break;
     }
   }
 
@@ -472,9 +603,19 @@ class Ingest {
          ON CONFLICT(player_id, ip) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen), times=times+1`
       ).run(p.id, String(ev.ip), time, time);
     }
-    // Close any dangling session for this player (missed disconnect), then open a new one.
-    const dangling = this.stmt('SELECT id, connect_at FROM sessions WHERE player_id=? AND disconnect_at IS NULL').all(p.id);
-    for (const s of dangling) this.closeSession(s.id, p.id, s.connect_at, Math.min(p.prevLastSeen, time));
+    // The roster poll announced this connection before its (lagging) log line
+    // arrived: adopt that session rather than open a second one.
+    const link = this._claimRosterJoin(eosId, time);
+    const same = link ? link.sessionId : this._sessionOfConnect(p.id, time);
+    if (same != null && this._adoptSession(same, ev, p, eosId, time)) return;
+    // Close any dangling session for this player (missed disconnect), then
+    // open a new one. A session opened after this line, beyond the window
+    // above, is a later connection the roster saw, not a dangling one.
+    const dangling = this._openSessions(p.id).filter((s) => Number(s.connect_at) <= time);
+    for (const s of dangling) {
+      this.closeSession(s.id, p.id, s.connect_at, Math.min(p.prevLastSeen, time));
+      this._noteQuietClose(Number(s.id));
+    }
     this.stmt('INSERT INTO sessions(player_id, connect_at) VALUES(?,?)').run(p.id, time);
 
     const rec = this.ensureLiveRecord(eosId, {
@@ -489,7 +630,9 @@ class Ingest {
     if (ev.controller && this.state && this.state.controllers) this.state.controllers.set(ev.controller, eosId);
     this.lastConnectedEos = eosId;
 
-    this.enforceBan(p.id, rec || { eosId }, time);
+    // This connection's in-game id is unknown until a poll lists it: a live
+    // record whose disconnect line never came holds the previous one's.
+    this.enforceBan(p.id, rec || { eosId, steamId: ev.steamId || null }, time, 'log', { byGameId: false });
     this.bus.emit('player-connected', { time, player: this.ref(rec, { dbId: p.id, eosId, steamId: ev.steamId || null }) });
   }
 
@@ -511,31 +654,482 @@ class Ingest {
     const eosId = lowerOrNull(ev.eosId);
     if (!eosId) return;
     const p = this.getOrCreatePlayer({ eosId, time });
-    const open = this.stmt('SELECT id, connect_at FROM sessions WHERE player_id=? AND disconnect_at IS NULL').all(p.id);
-    for (const s of open) this.closeSession(s.id, p.id, s.connect_at, time);
+    this._bootClosed.delete(p.id); // a logged leave: nothing left to resume
+    const open = this._openSessions(p.id);
+    // A session opened after this line is a newer connection the roster saw
+    // while the log trailed: it stays open, and so does the live record.
+    const ending = open.filter((s) => Number(s.connect_at) <= time);
+    // Nothing of this connection still open: a close already ended it, and
+    // the precise time is news. If that close was the roster's announced
+    // leave, it is the only news.
+    if (!ending.length && this._settleClosedLeave(eosId, p.id, time)) return;
+    for (const s of ending) {
+      this.closeSession(s.id, p.id, s.connect_at, time);
+      this._unlinkRoster(eosId, Number(s.id));
+    }
     const rec = this.state && this.state.players ? this.state.players.get(eosId) || null : null;
     const refOut = this.ref(rec, { dbId: p.id, eosId });
-    if (rec && rec.controller && this.state.controllers) this.state.controllers.delete(rec.controller);
-    if (this.state && this.state.players) this.state.players.delete(eosId);
+    if (ending.length === open.length) {
+      if (rec && rec.controller && this.state.controllers) this.state.controllers.delete(rec.controller);
+      if (this.state && this.state.players) this.state.players.delete(eosId);
+    }
     this.bus.emit('player-disconnected', { time, player: refOut });
   }
 
-  // ------------------------------------------------------------------- bans
+  // --------------------------------------------------------- roster sessions
+  //
+  // Without a game log the ListPlayers diff (state 'roster-joined' /
+  // 'roster-left') is the only join/leave source. With one, both describe the
+  // same connections and the log can trail by minutes (FTP), in either order.
+  // Each session the roster opens or closes keeps a link until the log line
+  // for that connection settles it: the log connect adopts the roster's
+  // session (precise start, no second announcement); the log disconnect
+  // re-times the roster's close (precise end, play_seconds moved by the
+  // difference only). Log lines arrive in order, which the matching relies on.
+  // Links live in memory only: after a panel restart the same windows are
+  // matched against the sessions table (_sessionOfConnect, _settleClosedLeave).
+  // link: {sessionId, playerId, joinAt, logIn, lastSeenAt, missedAt, leftAt,
+  // logOut, at} — logIn/logOut false = still expecting that log line.
 
-  enforceBan(dbId, rec, time) {
-    const ban = this.stmt(
-      `SELECT id, reason, expires_at FROM bans
-        WHERE player_id=? AND active=1 AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY id DESC LIMIT 1`
-    ).get(dbId, time);
-    if (!ban) return;
-    const until = ban.expires_at != null ? new Date(Number(ban.expires_at)).toISOString().slice(0, 10) : 'perm';
-    const reason = `Banned: ${ban.reason || 'no reason recorded'} (until ${until})`;
-    log.info('ingest', `ban enforcement: kicking player#${dbId} (${rec.name || rec.eosId || '?'})`, reason);
-    if (this.admin && typeof this.admin.execAdmin === 'function') {
-      // System action (§19.1.2): user NULL -> audited with user_id NULL by admin.js.
-      Promise.resolve(this.admin.execAdmin(null, 'kick', { playerId: dbId, reason }))
-        .catch((e) => log.warn('ingest', `ban enforcement kick failed: ${e.message}`));
+  _linkRoster(eosId, patch) {
+    let list = this._rosterLinks.get(eosId);
+    if (!list) {
+      list = [];
+      this._rosterLinks.set(eosId, list);
+    }
+    let l = list.find((x) => x.sessionId === patch.sessionId);
+    if (!l) {
+      l = {
+        sessionId: patch.sessionId, playerId: patch.playerId, joinAt: null, logIn: true,
+        lastSeenAt: null, missedAt: null, leftAt: null, logOut: true, at: 0,
+      };
+      list.push(l);
+    }
+    if (patch.joinAt != null) {
+      l.joinAt = patch.joinAt;
+      l.logIn = false;
+    }
+    if (patch.leftAt != null) {
+      l.leftAt = patch.leftAt;
+      l.lastSeenAt = patch.lastSeenAt;
+      l.missedAt = patch.missedAt;
+      l.logOut = false;
+    }
+    l.at = Date.now();
+    this._pruneLinks(eosId);
+    if (this._rosterLinks.size > 500) {
+      for (const k of [...this._rosterLinks.keys()]) this._pruneLinks(k);
+    }
+  }
+
+  // The log closed this session itself; the roster has nothing to settle.
+  _unlinkRoster(eosId, sessionId) {
+    const list = this._rosterLinks.get(eosId);
+    if (!list) return;
+    const kept = list.filter((l) => l.sessionId !== sessionId);
+    if (kept.length) this._rosterLinks.set(eosId, kept);
+    else this._rosterLinks.delete(eosId);
+  }
+
+  _pruneLinks(eosId) {
+    const list = this._rosterLinks.get(eosId);
+    if (!list) return;
+    const now = Date.now();
+    const kept = list.filter((l) => (!l.logIn || !l.logOut) && now - l.at < LINK_TTL_MS);
+    if (kept.length) this._rosterLinks.set(eosId, kept);
+    else this._rosterLinks.delete(eosId);
+  }
+
+  // PLAYER_CONNECTED -> the roster link of the same connection, or null when
+  // the roster never saw it.
+  _claimRosterJoin(eosId, time) {
+    const list = this._rosterLinks.get(eosId);
+    if (!list) return null;
+    let hit = null;
+    for (const l of list) {
+      if (l.logIn) continue;
+      if (time < l.joinAt - LINK_WINDOW_MS) break; // predates every connection the roster saw
+      l.logIn = true;
+      if (time <= l.joinAt + CLOCK_SLACK_MS) {
+        hit = l;
+        break;
+      }
+      // Connected after the roster already had them: a reconnect the roster
+      // missed. That link's own connect line never came.
+    }
+    this._pruneLinks(eosId);
+    return hit;
+  }
+
+  // PLAYER_CONNECTED that no link claimed: a session that began inside the
+  // claim window around the line and was still going at it is this same
+  // connection — the roster's, its link lost to a panel restart.
+  _sessionOfConnect(playerId, time) {
+    const s = this.stmt(
+      `SELECT id FROM sessions
+        WHERE player_id=? AND connect_at BETWEEN ? AND ?
+          AND (disconnect_at IS NULL OR disconnect_at > ?)
+        ORDER BY connect_at, id LIMIT 1`
+    ).get(playerId, time - CLOCK_SLACK_MS, time + LINK_WINDOW_MS, time);
+    return s ? Number(s.id) : null;
+  }
+
+  // The roster opened (and announced) this connection's session before the
+  // log line arrived: keep it, move its start to the precise log time, take
+  // what only the log knows (ip, controller) — and announce nothing.
+  _adoptSession(sessionId, ev, p, eosId, time) {
+    const s = this.stmt('SELECT connect_at, disconnect_at FROM sessions WHERE id=?').get(sessionId);
+    if (!s) return false;
+    const from = Number(s.connect_at) || 0;
+    const start = Math.min(from, time);
+    if (start !== from) {
+      this.stmt('UPDATE sessions SET connect_at=? WHERE id=?').run(start, sessionId);
+      if (s.disconnect_at != null) {
+        this._recredit(p.id, creditSecs(start, s.disconnect_at) - creditSecs(from, s.disconnect_at));
+      }
+    }
+    if (s.disconnect_at != null) {
+      // Already closed (a roster leave, or boot recovery): the
+      // JOIN_SUCCEEDED line that follows must not resurrect a live record.
+      this.lastConnectedEos = null;
+      return true;
+    }
+    const rec = this.ensureLiveRecord(eosId, {
+      dbId: p.id,
+      steamId: ev.steamId ? String(ev.steamId) : undefined,
+      ip: ev.ip || null,
+      controller: ev.controller || null,
+      connectedAt: start,
+      sessKills: 0, sessDeaths: 0, sessTks: 0, // §19.1.1: init on connect
+    });
+    if (rec && !rec.name && p.prevName) rec.name = p.prevName;
+    if (ev.controller && this.state && this.state.controllers) this.state.controllers.set(ev.controller, eosId);
+    this.lastConnectedEos = eosId;
+    this.enforceBan(p.id, rec || { eosId, steamId: ev.steamId || null }, time, 'log');
+    return true;
+  }
+
+  // PLAYER_DISCONNECTED that finds nothing of its connection open: a close
+  // already ended it, and that session takes the precise log time
+  // (play_seconds the difference). True when the close was a roster leave,
+  // already announced; false when the line is still news. A link knows its
+  // leave window: the player left between the roster's last sighting and the
+  // first poll that missed them. Without one (restart) the player's latest
+  // closed session counts if it ended near the line; if this process closed
+  // it without announcing anything, the line still announces.
+  _settleClosedLeave(eosId, playerId, time) {
+    const list = this._rosterLinks.get(eosId) || [];
+    const l = list.find((x) => !x.logOut
+      && time >= x.lastSeenAt - CLOCK_SLACK_MS && time <= x.missedAt + CLOCK_SLACK_MS);
+    if (l) {
+      l.logOut = true;
+      this._pruneLinks(eosId);
+      return this._retimeClose(l.sessionId, playerId, time);
+    }
+    const s = this.stmt(
+      `SELECT id, disconnect_at FROM sessions
+        WHERE player_id=? AND disconnect_at IS NOT NULL AND connect_at <= ?
+        ORDER BY connect_at DESC, id DESC LIMIT 1`
+    ).get(playerId, time);
+    if (!s || Math.abs(Number(s.disconnect_at) - time) > LINK_WINDOW_MS) return false;
+    const sid = Number(s.id);
+    if (list.some((x) => x.sessionId === sid)) return false; // its own link turned the line down
+    this._retimeClose(sid, playerId, time);
+    // A quiet close is announced by this line, and only once.
+    return !this._quietClosed.delete(sid);
+  }
+
+  // Moves a closed session's end to `time`; play_seconds follows by the difference.
+  _retimeClose(sessionId, playerId, time) {
+    const s = this.stmt('SELECT connect_at, disconnect_at FROM sessions WHERE id=?').get(sessionId);
+    if (!s || s.disconnect_at == null) return false;
+    const start = Number(s.connect_at) || 0;
+    const was = Number(s.disconnect_at);
+    const end = Math.max(start, time);
+    if (end !== was) {
+      this.stmt('UPDATE sessions SET disconnect_at=? WHERE id=?').run(end, sessionId);
+      this._recredit(playerId, creditSecs(start, end) - creditSecs(start, was));
+    }
+    return true;
+  }
+
+  // Undo boot crash recovery for a player the roster finds online right after
+  // the restart: they played through the blip, so the session continues (no
+  // join) and exactly the credit it now carries comes back off — a log
+  // connect since boot may have moved its start.
+  _resumeBootSession(playerId, time) {
+    const b = this._bootClosed.get(playerId);
+    if (!b) return false;
+    this._bootClosed.delete(playerId);
+    if (time - b.closedAt > RESUME_MS) return false;
+    const s = this.stmt('SELECT connect_at, disconnect_at FROM sessions WHERE id=?').get(b.sessionId);
+    if (!s || s.disconnect_at == null || Number(s.disconnect_at) !== b.closedAt) return false;
+    this.stmt('UPDATE sessions SET disconnect_at=NULL WHERE id=?').run(b.sessionId);
+    this._quietClosed.delete(b.sessionId);
+    this._recredit(playerId, -creditSecs(s.connect_at, s.disconnect_at));
+    return true;
+  }
+
+  // First roster after boot (state 'roster-baseline', reason 'boot'): nobody
+  // in it joined, and players boot recovery closed moments ago are still
+  // playing. One missed poll is not a leave, so a candidate it does not list
+  // gets the next poll too (onRosterJoined); after that poll boot recovery's
+  // closes stand (onRosterPolled). An RCON outage closes no session, so a
+  // reconnect baseline has nothing to resume.
+  onRosterBaseline(ev) {
+    try {
+      if (!ev || ev.reason !== 'boot' || !this._bootClosed.size) return;
+      this._bootResume = 'baseline';
+      const time = Number(ev.time) || Date.now();
+      let resumed = 0;
+      for (const pl of Array.isArray(ev.players) ? ev.players : []) {
+        const eosId = lowerOrNull(pl && pl.eosId);
+        const row = eosId ? this.stmt('SELECT id FROM players WHERE eos_id=?').get(eosId) : null;
+        if (!row) continue;
+        const pid = Number(row.id);
+        if (this._openSessions(pid).length) {
+          this._bootClosed.delete(pid); // a log connect since boot opened a new one
+          continue;
+        }
+        if (this._resumeBootSession(pid, time)) resumed++;
+      }
+      if (resumed) log.info('ingest', `resumed ${resumed} session(s) of players online through the restart`);
+    } catch (e) {
+      log.error('ingest', `roster baseline failed: ${e.message}`);
+    }
+  }
+
+  // End of a ListPlayers poll (state 'players-updated'): the boot baseline's
+  // poll, then the one after it, which ends the resume window.
+  onRosterPolled() {
+    if (this._bootResume === 'baseline') {
+      this._bootResume = 'next';
+    } else if (this._bootResume === 'next') {
+      this._bootResume = null;
+      this._bootClosed.clear();
+    }
+  }
+
+  // A join seen only as a new entry in the ListPlayers diff: open the session
+  // and announce it exactly as PLAYER_CONNECTED does — unless the log path
+  // already opened (and announced) this very connection.
+  onRosterJoined(ev) {
+    try {
+      const eosId = lowerOrNull(ev && ev.eosId);
+      if (!eosId) return;
+      const time = Number(ev.time) || Date.now();
+      const p = this.getOrCreatePlayer({ eosId, steamId: ev.steamId, name: ev.name, time });
+      const rec = this.state && typeof this.state.byEos === 'function' ? this.state.byEos(eosId) : null;
+      if (rec && !rec.dbId) rec.dbId = p.id;
+      // Before the session bookkeeping below: a join the log path already
+      // announced, or a boot resume, is still a banned player on the server.
+      this.enforceBan(p.id, rec || {
+        eosId, steamId: ev.steamId || null, playerId: ev.playerId != null ? ev.playerId : null, name: ev.name || null,
+      }, time, 'roster');
+      const open = this._openSessions(p.id);
+      if (open.some((s) => Number(s.connect_at) >= time - LINK_WINDOW_MS)) return;
+      // Older ones outlived a disconnect nobody saw (log gap): they ended by
+      // the last sighting.
+      for (const s of open) {
+        this.closeSession(s.id, p.id, s.connect_at, Math.min(p.prevLastSeen, time));
+        this._noteQuietClose(Number(s.id));
+      }
+      // Boot recovery's closes are candidates until the poll after the boot
+      // baseline: missed by the baseline alone is one missed poll, not a leave.
+      if (!open.length && this._resumeBootSession(p.id, time)) return;
+      const ins = this.stmt('INSERT INTO sessions(player_id, connect_at) VALUES(?,?)').run(p.id, time);
+      this._linkRoster(eosId, { sessionId: Number(ins.lastInsertRowid), playerId: p.id, joinAt: time });
+      if (this.bus) {
+        this.bus.emit('player-connected', {
+          time,
+          player: this.ref(rec, { dbId: p.id, eosId, steamId: ev.steamId || null, name: capName(ev.name), teamId: ev.teamId }),
+        });
+      }
+    } catch (e) {
+      log.error('ingest', `roster join failed: ${e.message}`);
+    }
+  }
+
+  // A leave seen only as an entry missing from consecutive polls: close the
+  // session and announce it exactly as PLAYER_DISCONNECTED does — unless the
+  // log path already did.
+  onRosterLeft(ev) {
+    try {
+      const eosId = lowerOrNull(ev && ev.eosId);
+      if (!eosId) return;
+      const time = Number(ev.time) || Date.now();
+      const lastSeenAt = Number(ev.lastSeenAt) || time;
+      const missedAt = Number(ev.missedAt) || time;
+      const row = this.stmt('SELECT id FROM players WHERE eos_id=?').get(eosId);
+      if (!row) return;
+      const pid = Number(row.id);
+      // Only the session of the connection the roster was watching: the
+      // latest begun by its last sighting. One opened after that is a newer
+      // connection (a quick rejoin the log reported); an earlier one still
+      // open is the log's, for a connection the roster never saw, and stays
+      // for the log to close.
+      let s = null;
+      for (const o of this._openSessions(pid)) {
+        if (Number(o.connect_at) > lastSeenAt + CLOCK_SLACK_MS) continue;
+        if (!s || Number(o.connect_at) >= Number(s.connect_at)) s = o;
+      }
+      if (!s) return; // PLAYER_DISCONNECTED closed and announced it first
+      this.closeSession(s.id, pid, s.connect_at, time);
+      this._linkRoster(eosId, { sessionId: Number(s.id), playerId: pid, lastSeenAt, missedAt, leftAt: time });
+      if (this.bus) {
+        this.bus.emit('player-disconnected', {
+          time,
+          player: this.ref(null, { dbId: pid, eosId, steamId: ev.steamId || null, name: capName(ev.name), teamId: ev.teamId }),
+        });
+      }
+    } catch (e) {
+      log.error('ingest', `roster leave failed: ${e.message}`);
+    }
+  }
+
+  // ------------------------------------------------------------------- bans
+  //
+  // A ban — issued in the panel or imported (source 'battlemetrics') —
+  // matches a player by db id, SteamID or EOS id. It is in force while
+  // active and unexpired at the later of the event time and now: the kick
+  // happens now, however late a log line arrives.
+
+  // Active bans matching any of these ids, in one scan of bans (a whole
+  // roster's worth per call).
+  _activeBans(dbIds, steamIds, eosIds, at) {
+    return this.stmt(
+      `SELECT id, player_id, steam_id, eos_id, reason, expires_at, source, external_id FROM bans
+        WHERE active = 1 AND (expires_at IS NULL OR expires_at > ?)
+          AND (player_id IN (SELECT value FROM json_each(?))
+            OR steam_id IN (SELECT value FROM json_each(?))
+            OR eos_id IN (SELECT value FROM json_each(?)))`
+    ).all(at, JSON.stringify(dbIds), JSON.stringify(steamIds), JSON.stringify(eosIds));
+  }
+
+  // {ban, matchedBy} for this player out of `bans`, or null.
+  _banFor(bans, dbId, steamIds, eosId) {
+    let best = null;
+    for (const b of bans) {
+      let by = null;
+      if (dbId != null && b.player_id != null && Number(b.player_id) === Number(dbId)) by = 'player';
+      else if (b.steam_id != null && steamIds.includes(String(b.steam_id))) by = 'steam';
+      else if (eosId && b.eos_id != null && String(b.eos_id).toLowerCase() === eosId) by = 'eos';
+      if (by && (!best || outranks(b, best.ban))) best = { ban: b, matchedBy: by };
+    }
+    return best;
+  }
+
+  // The player's SteamIDs: the live/event one and the one on their row.
+  _steamIdsOf(dbId, rec) {
+    const out = [];
+    const add = (v) => {
+      const s = v == null ? '' : String(v);
+      if (STEAM_ID_RE.test(s) && !out.includes(s)) out.push(s);
+    };
+    add(rec && rec.steamId);
+    if (dbId != null) {
+      const row = this.stmt('SELECT steam_id FROM players WHERE id=?').get(dbId);
+      if (row) add(row.steam_id);
+    }
+    return out;
+  }
+
+  _kickedRecently(key, now) {
+    const last = this._banKicks.get(key);
+    return last != null && now - last < BAN_KICK_GAP_MS;
+  }
+
+  // Kick through the admin layer, audited 'ban-enforce' as a system action
+  // (user NULL). Without an exact selector (no in-game id, no SteamID) nothing
+  // is sent and no gap starts: the next roster poll knows the in-game id.
+  // byGameId false: rec.playerId may belong to an earlier connection.
+  _kickBanned({ key, dbId, rec, steamIds, ban, matchedBy, via, now, byGameId = true }) {
+    const r = rec || {};
+    const text = banKickText(ban, now);
+    const gameId = byGameId && r.playerId != null && GAME_ID_RE.test(String(r.playerId)) ? String(r.playerId) : null;
+    const steam = steamIds[0] || null;
+    const command = gameId ? `AdminKickById ${gameId} ${text}` : (steam ? `AdminKick ${steam} ${text}` : null);
+    if (!command) return false;
+    this._banKicks.set(key, now);
+    if (this._banKicks.size > 500) {
+      for (const [k, t] of this._banKicks) if (now - t >= BAN_KICK_GAP_MS) this._banKicks.delete(k);
+    }
+    const targetPlayerId = dbId != null ? Number(dbId) : null;
+    log.info('ingest', `ban enforcement: kicking player#${targetPlayerId == null ? '?' : targetPlayerId} (${r.name || r.eosId || '?'})`, text);
+    Promise.resolve(this.admin.execRaw(null, command, {
+      action: 'ban-enforce',
+      targetPlayerId,
+      details: {
+        banId: Number(ban.id), source: ban.source || 'local',
+        externalId: ban.external_id == null ? null : String(ban.external_id),
+        matchedBy, via, reason: text,
+      },
+    })).catch((e) => log.warn('ingest', `ban enforcement kick failed: ${e.message}`));
+    return true;
+  }
+
+  // One connect (via 'log' or 'roster'). True when a kick was sent.
+  // opts.byGameId false: select by SteamID only (see _kickBanned).
+  enforceBan(dbId, rec, time, via = 'log', opts) {
+    if (!this.admin || typeof this.admin.execRaw !== 'function') return false;
+    try {
+      const r = rec || {};
+      const eosId = lowerOrNull(r.eosId);
+      const key = eosId || (dbId != null ? `#${dbId}` : null);
+      if (!key) return false;
+      const now = Date.now();
+      if (this._kickedRecently(key, now)) return false;
+      const steamIds = this._steamIdsOf(dbId, r);
+      const bans = this._activeBans(dbId != null ? [Number(dbId)] : [], steamIds, eosId ? [eosId] : [],
+        Math.max(Number(time) || 0, now));
+      const hit = this._banFor(bans, dbId, steamIds, eosId);
+      if (!hit) return false;
+      return this._kickBanned({
+        key, dbId, rec: r, steamIds, ban: hit.ban, matchedBy: hit.matchedBy, via, now,
+        byGameId: !(opts && opts.byGameId === false),
+      });
+    } catch (e) {
+      log.error('ingest', `ban enforcement failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  // After every ListPlayers poll (state 'players-updated'): whoever is online
+  // under an active ban — back inside the kick gap, banned or imported while
+  // playing, online at a panel restart, or missed by a kick that did not
+  // land — is kicked once their gap has passed.
+  sweepBans() {
+    if (!this.admin || typeof this.admin.execRaw !== 'function') return;
+    if (!this.state || !this.state.players || typeof this.state.players.values !== 'function') return;
+    try {
+      const now = Date.now();
+      const cands = [];
+      for (const rec of this.state.players.values()) {
+        const eosId = lowerOrNull(rec && rec.eosId);
+        if (!eosId || this._kickedRecently(eosId, now)) continue;
+        let dbId = rec.dbId != null ? Number(rec.dbId) : null;
+        if (dbId == null) {
+          const row = this.stmt('SELECT id FROM players WHERE eos_id=?').get(eosId);
+          dbId = row ? Number(row.id) : null;
+        }
+        cands.push({ rec, eosId, dbId, steamIds: this._steamIdsOf(dbId, rec) });
+      }
+      if (!cands.length) return;
+      const steams = new Set();
+      for (const c of cands) for (const s of c.steamIds) steams.add(s);
+      const bans = this._activeBans(cands.filter((c) => c.dbId != null).map((c) => c.dbId), [...steams],
+        cands.map((c) => c.eosId), now);
+      if (!bans.length) return;
+      for (const c of cands) {
+        const hit = this._banFor(bans, c.dbId, c.steamIds, c.eosId);
+        if (!hit) continue;
+        this._kickBanned({
+          key: c.eosId, dbId: c.dbId, rec: c.rec, steamIds: c.steamIds,
+          ban: hit.ban, matchedBy: hit.matchedBy, via: 'poll', now,
+        });
+      }
+    } catch (e) {
+      log.error('ingest', `ban sweep failed: ${e.message}`);
     }
   }
 

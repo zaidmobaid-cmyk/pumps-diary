@@ -43,6 +43,10 @@ const CHAT_LINES = [
   'заходим с фланга', 'où est le FOB ?', 'vamos amigos', '敌人在北边',
   'free kit in main', 'need crewman for MBT', 'spawning rally', 'cap is bleeding, back cap!',
 ];
+const ADMIN_CALLS = [
+  '!admin someone keeps teamkilling at main', '!admin griefer shooting our radio',
+  '!admin guy blocking the main exit with a logi', '!admin squad lead is being toxic on comms',
+];
 
 function rnd(n) { return Math.floor(Math.random() * n); }
 function pick(arr) { return arr[rnd(arr.length)]; }
@@ -244,6 +248,14 @@ function runLiveScenario(mock) {
     const channel = pick(['all', 'all', 'team', 'team', 'team', 'squad']);
     mock.chat(who, channel, pick(CHAT_LINES));
   });
+
+  // a player calls an admin ~90s in, then every 3-6 min
+  const callAdmin = () => {
+    const players = mock.onlinePlayers();
+    if (players.length) mock.chat(pick(players), pick(['all', 'team']), pick(ADMIN_CALLS));
+  };
+  after(90000, callAdmin);
+  every(180000, 360000, callAdmin);
 
   // joins/leaves every 25-70s, pop kept within 36-60
   every(25000, 70000, () => {

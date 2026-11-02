@@ -190,7 +190,7 @@ async function startServer({ tmp, logPath, mock, transcript }) {
       const timer = setTimeout(() => resolve('timeout'), 15000);
       const check = (c) => {
         feed(c);
-        if (/SquadWatch v[^\n]* up: http/.test(buf)) { clearTimeout(timer); resolve('up'); }
+        if (/A3 Admin v[^\n]* up: http/.test(buf)) { clearTimeout(timer); resolve('up'); }
       };
       child.stdout.on('data', check);
       child.stderr.on('data', feed);

@@ -4,6 +4,9 @@
 // §19.3.15 (first-run setup token), §19.3.18 (session JOIN + disabled check,
 // destroyUserSessions on user mutation), §19.3.19 (limiter keyed on clientIp,
 // capped + swept map), §19.3.23 (viewer may NOT read audit).
+// Login hardening: limiter keyed per address (IPv6 by /64) AND per username,
+// password checks on the threadpool behind an in-flight cap, and an
+// 8-character minimum for new passwords.
 const crypto = require('node:crypto');
 const { log, sha256hex, randomTokenHex } = require('./util');
 
@@ -15,100 +18,288 @@ const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 64;
 
+// Applies to NEW passwords only: accounts stored before it keep logging in.
+const MIN_PASSWORD_CHARS = 8;
+const MAX_PASSWORD_CHARS = 1024;
+
+// scrypt runs on libuv's threadpool (4 threads by default); checks beyond
+// this many would only queue there, so verifyLogin refuses them outright.
+const MAX_PASSWORD_CHECKS = 4;
+
+// Sync on purpose: account creation is rare and runs inside db.tx.
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(String(pw), salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P });
   return `scrypt$N=${SCRYPT_N},r=${SCRYPT_R},p=${SCRYPT_P}$${salt.toString('base64')}$${key.toString('base64')}`;
 }
 
+// null when `pw` is acceptable as a new password, else why not (the API's
+// 400 message).
+function passwordProblem(pw) {
+  if (typeof pw !== 'string' || pw.length === 0) return 'password required';
+  if (pw.length > MAX_PASSWORD_CHARS) return 'password too long';
+  // Code points, so an emoji counts once rather than as two UTF-16 halves.
+  if ([...pw].length < MIN_PASSWORD_CHARS) return `password must be at least ${MIN_PASSWORD_CHARS} characters`;
+  return null;
+}
+
 const HASH_RE = /^scrypt\$N=(\d+),r=(\d+),p=(\d+)\$([A-Za-z0-9+/=]+)\$([A-Za-z0-9+/=]+)$/;
 
-function verifyPassword(pw, stored) {
+// Parsed stored hash, or null when it is not one we can check.
+function parseHash(stored) {
+  const m = HASH_RE.exec(String(stored == null ? '' : stored));
+  if (!m) return null;
+  const N = parseInt(m[1], 10);
+  const r = parseInt(m[2], 10);
+  const p = parseInt(m[3], 10);
+  // Sanity bounds: our own format only ever writes 16384/8/1, but stay
+  // self-describing without letting a corrupt row allocate gigabytes.
+  if (!(N >= 2 && N <= 131072) || !(r >= 1 && r <= 32) || !(p >= 1 && p <= 16)) return null;
+  if ((N & (N - 1)) !== 0) return null; // N must be a power of two
+  const salt = Buffer.from(m[4], 'base64');
+  const want = Buffer.from(m[5], 'base64');
+  if (want.length < 16 || want.length > 128) return null;
+  return { N, r, p, salt, want };
+}
+
+// crypto.scrypt (not scryptSync): a check must never stall the event loop
+// that carries SSE, RCON polling and every other request.
+function scryptAsync(pw, salt, keylen, opts) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(pw, salt, keylen, opts, (err, key) => (err ? reject(err) : resolve(key)));
+  });
+}
+
+async function checkHash(pw, h) {
   try {
-    const m = HASH_RE.exec(String(stored == null ? '' : stored));
-    if (!m) return false;
-    const N = parseInt(m[1], 10);
-    const r = parseInt(m[2], 10);
-    const p = parseInt(m[3], 10);
-    // Sanity bounds: our own format only ever writes 16384/8/1, but stay
-    // self-describing without letting a corrupt row allocate gigabytes.
-    if (!(N >= 2 && N <= 131072) || !(r >= 1 && r <= 32) || !(p >= 1 && p <= 16)) return false;
-    if ((N & (N - 1)) !== 0) return false; // N must be a power of two
-    const salt = Buffer.from(m[4], 'base64');
-    const want = Buffer.from(m[5], 'base64');
-    if (want.length < 16 || want.length > 128) return false;
-    const got = crypto.scryptSync(String(pw), salt, want.length, {
-      N, r, p, maxmem: Math.max(64 * 1024 * 1024, 256 * N * r),
+    const got = await scryptAsync(String(pw), h.salt, h.want.length, {
+      N: h.N, r: h.r, p: h.p, maxmem: Math.max(64 * 1024 * 1024, 256 * h.N * h.r),
     });
-    return got.length === want.length && crypto.timingSafeEqual(got, want);
+    return got.length === h.want.length && crypto.timingSafeEqual(got, h.want);
   } catch (_e) {
     return false;
   }
 }
 
-// Used to equalize timing when the username does not exist.
+// Resolves true/false; an unusable stored hash is simply false.
+async function verifyPassword(pw, stored) {
+  const h = parseHash(stored);
+  return h ? checkHash(pw, h) : false;
+}
+
+// Unknown users and unreadable stored hashes are checked against this, so
+// every failed login pays exactly one scrypt (no timing oracle for names).
 let _dummyHash = null;
 function dummyHash() {
-  if (!_dummyHash) _dummyHash = hashPassword(randomTokenHex(12));
+  if (!_dummyHash) _dummyHash = parseHash(hashPassword(randomTokenHex(12)));
   return _dummyHash;
 }
 
 // ------------------------------------------------------------- login limiter
 
-// §12 + §19.3.19: in-memory per-clientIp limiter, 5 attempts / 60s -> 429 at the
-// API layer. Map capped at 10k entries, swept per minute (interval is unref'd
-// so it never keeps the process alive; sweeps also run lazily on attempt()).
-function createLoginLimiter({ max = 5, windowMs = 60000, maxEntries = 10000 } = {}) {
-  const hits = new Map(); // key -> [attempt timestamps within window]
+function ipv4Octets(s) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return null;
+  const o = m.slice(1).map(Number);
+  return o.every((n) => n <= 255) ? o : null;
+}
+
+// Eight 16-bit groups, or null. Expands '::' and a trailing dotted quad
+// ('::ffff:192.0.2.1').
+function ipv6Hextets(s) {
+  if (s.length > 45 || !/^[0-9a-f:.]+$/i.test(s)) return null;
+  let str = s;
+  if (str.includes('.')) {
+    const cut = str.lastIndexOf(':');
+    const o = cut >= 0 ? ipv4Octets(str.slice(cut + 1)) : null;
+    if (!o) return null;
+    str = `${str.slice(0, cut + 1)}${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  }
+  const halves = str.split('::');
+  if (halves.length > 2) return null;
+  const groups = (x) => (x === '' ? [] : x.split(':'));
+  const head = groups(halves[0]);
+  const tail = halves.length === 2 ? groups(halves[1]) : [];
+  if (!head.concat(tail).every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return null;
+  const zeros = 8 - head.length - tail.length;
+  if (halves.length === 2 ? zeros < 1 : zeros !== 0) return null;
+  return head.concat(new Array(zeros).fill('0'), tail).map((g) => parseInt(g, 16));
+}
+
+// Limiter key for a client address. IPv4 — also IPv4-mapped IPv6, as a
+// dual-stack socket reports it — stays exact. IPv6 collapses to its /64, one
+// subscriber's allocation: whoever holds a /64 can rotate the low 64 bits
+// freely, and each rotation must not buy a fresh bucket. Brackets, a trailing
+// :port and a %zone are tolerated; anything unparseable is keyed by its own
+// (bounded) text.
+function clientAddressKey(ip) {
+  let s = String(ip == null ? '' : ip).trim();
+  const bracketed = /^\[([^\]]*)\](?::\d+)?$/.exec(s);
+  if (bracketed) s = bracketed[1];
+  else {
+    const v4port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(s);
+    if (v4port) s = v4port[1];
+  }
+  const zone = s.indexOf('%');
+  if (zone >= 0) s = s.slice(0, zone);
+  const v4 = ipv4Octets(s);
+  if (v4) return v4.join('.');
+  const h = ipv6Hextets(s);
+  if (!h) return s.toLowerCase().slice(0, 64);
+  if (h.slice(0, 5).every((x) => x === 0) && h[5] === 0xffff) {
+    return [h[6] >> 8, h[6] & 255, h[7] >> 8, h[7] & 255].join('.');
+  }
+  const net = h.slice(0, 4);
+  while (net.length && net[net.length - 1] === 0) net.pop();
+  return `${net.map((x) => x.toString(16)).join(':')}::/64`;
+}
+
+// Username limiter key: groups exactly the spellings the users table resolves
+// to one account (username TEXT UNIQUE COLLATE NOCASE, looked up trimmed).
+// NOCASE folds ASCII A-Z only — toLowerCase() would also merge 'kilo' with
+// '\u212Ailo' (KELVIN SIGN), a separate account whose logins would then clear
+// kilo's failures. NOCASE also stops comparing at the first NUL (byte lengths
+// must still match), and SQLite receives a lone surrogate as U+FFFD: keying
+// those spellings apart would hand one account many fresh buckets.
+function usernameKey(username) {
+  const s = String(username == null ? '' : username).trim().toWellFormed();
+  const nul = s.indexOf('\0');
+  const head = (nul < 0 ? s : s.slice(0, nul)).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  return nul < 0 ? head : `${head}\0${Buffer.byteLength(s)}`;
+}
+
+// §12 + §19.3.19, two independent limits (-> 429 at the API layer):
+//  - per client address (clientAddressKey): EVERY attempt counts and no
+//    success resets it, so an account holder cannot clear their own
+//    address's bucket between guesses at someone else's account.
+//  - per username (usernameKey): failed password checks only; only that
+//    account's own successful login clears them. Unknown names are tracked
+//    exactly like real ones, so the limiter is no username oracle. Checks
+//    still running count toward the limit (claimUser reserves one before the
+//    async check), so a concurrent burst cannot overshoot it.
+// Both maps are capped, dropping the least recently touched key first, and
+// swept per minute (interval unref'd so it never keeps the process alive;
+// sweeps also run lazily on use). Username failures are only recorded after
+// a real scrypt check, which the in-flight cap throttles, so evicting a live
+// entry by spraying unique names takes minutes of saturated logins at this
+// maxUserEntries.
+function createLoginLimiter({
+  max = 10, windowMs = 60000, maxEntries = 10000,
+  userMax = 10, userWindowMs = 600000, maxUserEntries = 50000,
+} = {}) {
+  const hits = new Map(); // address key -> attempt timestamps within windowMs
+  const fails = new Map(); // username key -> newest failure timestamps within userWindowMs
+  // username key -> claimed checks not yet settled. Each claim settles within
+  // one password check, so this map needs no sweep or cap.
+  const claims = new Map();
   let lastSweep = Date.now();
+
+  function prune(map, win, t) {
+    for (const [key, arr] of map) {
+      const live = arr.filter((ts) => t - ts < win);
+      if (live.length === 0) map.delete(key);
+      else map.set(key, live);
+    }
+  }
+  // Map order is insertion order and touch() re-inserts, so the first key is
+  // the least recently touched.
+  function cap(map, limit) {
+    while (map.size > limit) {
+      const oldest = map.keys().next();
+      if (oldest.done) break;
+      map.delete(oldest.value);
+    }
+  }
+  function touch(map, key, arr) {
+    map.delete(key);
+    map.set(key, arr);
+  }
 
   function sweep(now) {
     const t = now == null ? Date.now() : now;
     lastSweep = t;
-    for (const [key, arr] of hits) {
-      const live = arr.filter((ts) => t - ts < windowMs);
-      if (live.length === 0) hits.delete(key);
-      else hits.set(key, live);
-    }
-    trim();
+    prune(hits, windowMs, t);
+    prune(fails, userWindowMs, t);
+    cap(hits, maxEntries);
+    cap(fails, maxUserEntries);
   }
-
-  function trim() {
-    // Hard cap: drop oldest-inserted entries beyond maxEntries.
-    while (hits.size > maxEntries) {
-      const oldest = hits.keys().next();
-      if (oldest.done) break;
-      hits.delete(oldest.value);
-    }
+  function lazySweep(now) {
+    if (now - lastSweep >= 60000) sweep(now);
   }
 
   const timer = setInterval(() => sweep(), 60000);
   if (typeof timer.unref === 'function') timer.unref();
 
+  // Seconds until fewer than `limit` timestamps remain inside the window.
+  function retryAfterSec(arr, limit, win, now) {
+    return Math.max(1, Math.ceil((arr[arr.length - limit] + win - now) / 1000));
+  }
+
   function attempt(ip) {
     const now = Date.now();
-    if (now - lastSweep >= 60000) sweep(now);
-    const key = String(ip == null ? '' : ip);
+    lazySweep(now);
+    const key = clientAddressKey(ip);
     const arr = (hits.get(key) || []).filter((ts) => now - ts < windowMs);
     if (arr.length >= max) {
-      hits.set(key, arr);
-      const retryAfterSec = Math.max(1, Math.ceil((arr[0] + windowMs - now) / 1000));
-      return { ok: false, retryAfterSec };
+      touch(hits, key, arr);
+      return { ok: false, retryAfterSec: retryAfterSec(arr, max, windowMs, now) };
     }
     arr.push(now);
-    hits.set(key, arr);
-    trim();
+    touch(hits, key, arr);
+    cap(hits, maxEntries);
     return { ok: true, remaining: max - arr.length };
   }
 
-  function reset(ip) { hits.delete(String(ip == null ? '' : ip)); }
+  function recordFailure(key) {
+    const now = Date.now();
+    // Only the newest userMax failures can ever decide the lock.
+    const arr = (fails.get(key) || []).filter((ts) => now - ts < userWindowMs).concat(now).slice(-userMax);
+    touch(fails, key, arr);
+    cap(fails, maxUserEntries);
+  }
+
+  // Reserves one password check against `username`'s limit, or refuses once
+  // its failures plus the checks still in flight reach userMax. The caller
+  // settles the claim exactly once: fail() records a failure; succeed()
+  // clears that account's failures (never an address bucket, and claims
+  // still in flight keep counting); release() when no check ran. Later calls
+  // are no-ops.
+  function claimUser(username) {
+    const now = Date.now();
+    lazySweep(now);
+    const key = usernameKey(username);
+    const arr = (fails.get(key) || []).filter((ts) => now - ts < userWindowMs);
+    const pending = claims.get(key) || 0;
+    if (arr.length + pending >= userMax) {
+      // Held only by running checks, the lock lifts or hardens within a second.
+      const wait = arr.length >= userMax ? retryAfterSec(arr, userMax, userWindowMs, now) : 1;
+      return { ok: false, retryAfterSec: wait };
+    }
+    claims.set(key, pending + 1);
+    let open = true;
+    const settle = (then) => () => {
+      if (!open) return;
+      open = false;
+      const left = (claims.get(key) || 1) - 1;
+      if (left > 0) claims.set(key, left);
+      else claims.delete(key);
+      if (then) then(key);
+    };
+    return {
+      ok: true,
+      fail: settle(recordFailure),
+      succeed: settle((k) => fails.delete(k)),
+      release: settle(null),
+    };
+  }
 
   return {
     attempt,
-    reset,
+    claimUser,
     sweep,
     stop() { clearInterval(timer); },
     get size() { return hits.size; },
+    get userSize() { return fails.size; },
   };
 }
 
@@ -134,6 +325,7 @@ const PERM_MIN_ROLE = {
   squad: 'admin',      // disband/remove/demote commander
   layer: 'admin',      // change/queue layers
   match: 'admin',      // restart/end match
+  quickcmd: 'admin',   // run the owner-approved quick commands (presets)
   ips: 'admin',        // player IPs + alt detection
   adminChat: 'admin',  // admin-channel chat + ADMIN_CAM intel
   audit: 'admin',      // §19.3.23: viewer gets 403 on /api/audit
@@ -162,6 +354,7 @@ const PERM_INFO = [
   { key: 'squad', group: 'Server control', label: 'Manage squads' },
   { key: 'layer', group: 'Server control', label: 'Change layers' },
   { key: 'match', group: 'Server control', label: 'Restart / end matches' },
+  { key: 'quickcmd', group: 'Server control', label: 'Run quick commands' },
   { key: 'slomo', group: 'Server control', label: 'Slow motion' },
   { key: 'raw', group: 'Administration', label: 'Raw RCON console' },
   { key: 'users', group: 'Administration', label: 'Manage users & invites' },
@@ -370,8 +563,8 @@ function createAuth({ db, config, bus } = {}) {
   function createUser(username, password, role) {
     const uname = String(username == null ? '' : username).trim();
     if (!uname || uname.length > 64) throw new Error('username must be 1-64 characters');
-    if (typeof password !== 'string' || password.length < 1) throw new Error('password required');
-    if (password.length > 1024) throw new Error('password too long');
+    const weak = passwordProblem(password);
+    if (weak) throw new Error(weak);
     const r = roleRow(role);
     if (!r) throw new Error('unknown role');
     const t = now();
@@ -396,22 +589,40 @@ function createAuth({ db, config, bus } = {}) {
     return user;
   }
 
-  function verifyLogin(username, password) {
-    const uname = String(username == null ? '' : username).trim();
-    const row = uname
-      ? stmt(
-        `SELECT u.id, u.username, u.pass_hash, u.disabled, r.id AS role_id, r.name AS role, r.perms AS perms
-           FROM users u JOIN roles r ON r.id = u.role_id WHERE u.username = ?`
-      ).get(uname)
-      : undefined;
-    if (!row) {
-      verifyPassword(String(password == null ? '' : password), dummyHash()); // timing equalizer
-      return null;
+  dummyHash(); // built now, at boot, instead of on the first unknown-user login
+
+  let checksInFlight = 0;
+
+  // Resolves the user, or null for ANY failure (wrong password, unknown,
+  // disabled, unreadable hash) — each path awaits exactly one scrypt. When
+  // MAX_PASSWORD_CHECKS are already running it rejects at once with
+  // code 'ELOGINBUSY' (+ retryAfterSec) rather than queueing.
+  async function verifyLogin(username, password) {
+    if (checksInFlight >= MAX_PASSWORD_CHECKS) {
+      const busy = new Error('too many password checks in progress');
+      busy.code = 'ELOGINBUSY';
+      busy.retryAfterSec = 1;
+      throw busy;
     }
-    const ok = verifyPassword(String(password == null ? '' : password), row.pass_hash);
-    if (!ok || row.disabled) return null;
-    stmt('UPDATE users SET last_login=? WHERE id=?').run(now(), row.id);
-    return { id: row.id, username: row.username, role: row.role, roleId: row.role_id, perms: parsePerms(row.role_id, row.perms) };
+    checksInFlight++;
+    try {
+      const uname = String(username == null ? '' : username).trim();
+      const row = uname ? stmt('SELECT id, pass_hash FROM users WHERE username = ?').get(uname) : undefined;
+      const stored = row ? parseHash(row.pass_hash) : null;
+      const ok = await checkHash(String(password == null ? '' : password), stored || dummyHash());
+      if (!stored || !ok) return null;
+      // The check yielded to the event loop: re-read, so a password reset or
+      // a disable that landed meanwhile still wins.
+      const cur = stmt(
+        `SELECT u.id, u.username, u.pass_hash, u.disabled, r.id AS role_id, r.name AS role, r.perms AS perms
+           FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`
+      ).get(row.id);
+      if (!cur || cur.disabled || cur.pass_hash !== row.pass_hash) return null;
+      stmt('UPDATE users SET last_login=? WHERE id=?').run(now(), cur.id);
+      return { id: cur.id, username: cur.username, role: cur.role, roleId: cur.role_id, perms: parsePerms(cur.role_id, cur.perms) };
+    } finally {
+      checksInFlight--;
+    }
   }
 
   // ---------------------------------------------------------------- sessions
@@ -580,6 +791,7 @@ function createAuth({ db, config, bus } = {}) {
     // passwords
     hashPassword,
     verifyPassword,
+    passwordProblem,
     // users
     createUser,
     verifyLogin,
@@ -618,6 +830,6 @@ function createAuth({ db, config, bus } = {}) {
 }
 
 module.exports = {
-  createAuth, hashPassword, verifyPassword, can, createLoginLimiter, ROLES,
+  createAuth, hashPassword, verifyPassword, passwordProblem, can, createLoginLimiter, clientAddressKey, ROLES,
   PERM_KEYS, PERM_INFO, builtinRolePerms, sanitizePerms,
 };

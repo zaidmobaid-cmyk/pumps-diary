@@ -24,6 +24,17 @@
   "autoWarnTeamkiller": false,
   "autoWarnMessage": "Teamkill detected: {victim}. TKs are logged. Apologize in all-chat.",
   "retention": { "chatDays": 0, "popDays": 30 },
+  "battlemetrics": { "token": "", "banListId": "", "autoSync": false, "syncHours": 6 },
+  "evidence": { "maxMB": 50 },
+  "remoteBanList": { "enabled": false, "key": "", "includeEos": false },
+  "adminCalls": {
+    "enabled": true,
+    "triggers": ["!admin"],
+    "discordRoleId": "",
+    "reply": "Admins have been notified - hang tight.",
+    "cooldownSec": 60
+  },
+  "joinAlerts": { "watchlist": true, "flagged": true, "banEvasion": true, "autoKickEvasion": false },
   "demo": false,
   "logUnparsed": false
 }

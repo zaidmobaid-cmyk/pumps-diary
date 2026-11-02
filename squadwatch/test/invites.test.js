@@ -57,7 +57,7 @@ test('findInvite answers with role info only for currently-claimable tokens', ()
 
 // ---------------------------------------------------------------------- claim
 
-test('claimInvite creates the user with the invite role, consumes it exactly once', () => {
+test('claimInvite creates the user with the invite role, consumes it exactly once', async () => {
   const { db, auth } = freshAuth();
   const role = auth.createRole('Recruiter', { view: true, kick: true });
   const inv = auth.createInvite({ roleId: role.id, ttlMs: HOUR });
@@ -69,7 +69,7 @@ test('claimInvite creates the user with the invite role, consumes it exactly onc
   assert.strictEqual(Number(row.used_by), user.id);
   assert.ok(Number(row.used_at) > 0);
   // the account works and carries the invite's role perms
-  const login = auth.verifyLogin('newbie', 'pw123456');
+  const login = await auth.verifyLogin('newbie', 'pw123456');
   assert.ok(login && login.roleId === role.id);
   assert.deepStrictEqual(login.perms, { view: true, kick: true });
   // single use: a SECOND claim of the same token fails

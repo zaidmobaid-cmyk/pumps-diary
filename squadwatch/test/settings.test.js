@@ -9,6 +9,10 @@
 //   persistUserConfig: sparse + pretty JSON, atomic tmp+rename, loadConfig
 //   round-trip.
 //
+// IN-PROCESS — POST /api/settings when config.json could not be written: the
+// caller gets the reason, scrubbed of secrets; the audit row, which roles
+// without `settings` read, only a fixed marker (no OS message, no path).
+//
 // INTEGRATION — boot the REAL server (spawned like integration.test.js) with
 // squad.rconHost '' (no server linked), then link an in-process MockSquad live
 // through POST /api/settings: RCON retargets within seconds, config.json gains
@@ -26,6 +30,11 @@ const { spawn } = require('node:child_process');
 
 const { MockSquad } = require('./mock-squad');
 const { loadConfig, applySettingsPatch, persistUserConfig } = require('../server/config');
+const { openDb } = require('../server/db');
+const { createAuth } = require('../server/auth');
+const { createAdmin } = require('../server/admin');
+const { createApi } = require('../server/api');
+const LiveState = require('../server/state');
 
 const ROOT = path.resolve(__dirname, '..');
 const SERVER_JS = path.join(ROOT, 'server', 'index.js');
@@ -229,6 +238,87 @@ test('persistUserConfig writes sparse pretty JSON atomically and round-trips loa
   }
 });
 
+test('a broken config.json is reported by position, never by quoting its text', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sw-cfg-broken-'));
+  const file = path.join(dir, 'config.json');
+  try {
+    // V8 quotes the text around an unexpected token: here, the password.
+    for (const [text, where] of [
+      ['{"squad": {"rconPassword": Hunter2Secret}}', /\(syntax error\)/],
+      ['{"squad":{"rconPassword":"Hunter2Secret"', /line 1, column \d+/],
+    ]) {
+      fs.writeFileSync(file, text);
+      const cfg = loadConfig(path.join(dir, 'absent.json'));
+      const res = applySettingsPatch(cfg, { squad: { rconHost: 'x.example' } });
+      assert.throws(() => persistUserConfig(file, res.changedPaths, cfg), (e) => {
+        assert.match(e.message, where);
+        assert.ok(!/Hunter2/.test(e.message), `no file text in: ${e.message}`);
+        return true;
+      });
+      assert.throws(() => loadConfig(file), (e) => {
+        assert.match(e.message, /is not valid JSON/);
+        assert.ok(!/Hunter2/.test(e.message), `no file text in: ${e.message}`);
+        return true;
+      });
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), text, 'the broken file is left untouched');
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------ IN-PROCESS: config.json not written
+
+test('a save that applied but could not be written: the caller gets the reason, scrubbed; the audit row only a marker', async (t) => {
+  const { dir, cfg } = freshCfg({});
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  cfg.squad.rconPassword = 'Hunter2Secret';
+  const why = "EPERM: operation not permitted, rename 'C:\\Users\\Zaid\\panel\\config.json.tmp-1' -> " +
+    "'C:\\Users\\Zaid\\panel\\config.json' Hunter2Secret";
+  let failWrite = true;
+  const runtime = {
+    applySettings(patch) {
+      const res = applySettingsPatch(cfg, patch);
+      if (failWrite && res.changedPaths.length) res.persistError = why;
+      return res;
+    },
+  };
+  const db = openDb(':memory:');
+  db.migrate();
+  t.after(() => db.close());
+  const auth = createAuth({ db, config: cfg });
+  t.after(() => auth.loginLimiter.stop());
+  const rcon = { status: { connected: false, authed: false }, async exec() { throw new Error('not linked'); } };
+  const state = new LiveState();
+  const admin = createAdmin({ db, rcon, state, auth, config: cfg });
+  const server = createApi({ db, state, rcon, auth, admin, config: cfg, runtime });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const api = makeApi(`http://127.0.0.1:${server.address().port}`);
+  const login = (name, role) => {
+    const u = auth.createUser(name, 'password-123', role);
+    return { cookie: `sw_session=${auth.createSession(u.id, {}).token}` };
+  };
+  const owner = login('owner1', 'owner');
+  const auditor = login('admin1', 'admin'); // reads the audit log, holds no `settings`
+
+  const saved = await api(owner, 'POST', '/api/settings', { autoWarnTeamkiller: true });
+  assert.strictEqual(saved.status, 200, saved.text);
+  assert.deepStrictEqual(saved.json.changed, ['autoWarnTeamkiller']);
+  assert.strictEqual(saved.json.persistError, why.replace('Hunter2Secret', '•••'), 'the caller: the reason, scrubbed');
+  failWrite = false;
+  const fine = await api(owner, 'POST', '/api/settings', { autoWarnTeamkiller: false });
+  assert.strictEqual(fine.json.persistError, null);
+
+  const audit = await api(auditor, 'GET', '/api/audit?action=settings-update');
+  assert.strictEqual(audit.status, 200, audit.text);
+  assert.deepStrictEqual(audit.json.rows.map((r) => r.details), [
+    { changed: ['autoWarnTeamkiller'], persistError: null },
+    { changed: ['autoWarnTeamkiller'], persistError: 'config.json not written — see the panel log' },
+  ]);
+  assert.ok(!/EPERM|Zaid|Hunter2/.test(audit.text), audit.text);
+});
+
 // ------------------------------------------------------ integration helpers
 // (copied/trimmed from integration.test.js — same spawn/ipc/port patterns)
 
@@ -272,13 +362,13 @@ function waitExit(child, ms) {
 // Spawn the real server with squad.rconHost '' — no server linked yet (§3):
 // RCON stays idle and the Settings API links the mock later. web.port 0 is not
 // supported, so pick random high ports and retry on EADDRINUSE.
-async function startServer({ tmp, logPath, transcript }) {
+async function startServer({ tmp, logPath, transcript, web }) {
   let lastFail = '';
   for (let attempt = 0; attempt < 5; attempt++) {
     const port = 20000 + Math.floor(Math.random() * 20000);
     const cfgPath = path.join(tmp, 'config.json');
     fs.writeFileSync(cfgPath, JSON.stringify({
-      web: { port, host: '127.0.0.1' },
+      web: Object.assign({ port, host: '127.0.0.1' }, web || {}),
       // rconHost '' = not linked; 21114 is just the placeholder default port.
       squad: { rconHost: '', rconPort: 21114, rconPassword: '' },
       log: { mode: 'local', path: logPath, pollMs: 100, backfill: true },
@@ -304,7 +394,7 @@ async function startServer({ tmp, logPath, transcript }) {
       const timer = setTimeout(() => resolve('timeout'), 15000);
       const check = (c) => {
         feed(c);
-        if (/SquadWatch v[^\n]* up: http/.test(buf)) { clearTimeout(timer); resolve('up'); }
+        if (/A3 Admin v[^\n]* up: http/.test(buf)) { clearTimeout(timer); resolve('up'); }
       };
       child.stdout.on('data', check);
       child.stderr.on('data', feed);
@@ -413,7 +503,7 @@ test('integration: boot unlinked, link a MockSquad live via POST /api/settings (
       });
       assert.strictEqual(probe.status, 200, `test: ${probe.text}`);
       assert.strictEqual(probe.json.ok, true, `probe failed: ${probe.text}`);
-      assert.strictEqual(probe.json.serverName, 'SquadWatch Mock Server');
+      assert.strictEqual(probe.json.serverName, 'A3 Demo Server');
 
       step('POST /api/settings/test with a wrong password fails naming the password');
       const bad = await api(owner, 'POST', '/api/settings/test', {
@@ -460,6 +550,39 @@ test('integration: boot unlinked, link a MockSquad live via POST /api/settings (
       await waitExit(child, 3000).catch(() => {});
     }
     await mock.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('behind a trusted HTTPS proxy, plain-HTTP visits are redirected to the public HTTPS origin', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'squadwatch-https-'));
+  const logPath = path.join(tmp, 'SquadGame.log');
+  const transcript = { text: '' };
+  let child = null;
+  try {
+    const app = await startServer({
+      tmp, logPath, transcript,
+      web: { trustProxy: true, publicUrl: 'https://panel.example.test/' },
+    });
+    child = app.child;
+    const base = `http://127.0.0.1:${app.port}`;
+    const get = (p, headers) => fetch(base + p, { headers, redirect: 'manual' });
+
+    const viaHttp = await get('/api/bootstrap?x=1', { 'x-forwarded-proto': 'http' });
+    assert.strictEqual(viaHttp.status, 308, 'plain-HTTP visit through the proxy is redirected');
+    assert.strictEqual(viaHttp.headers.get('location'), 'https://panel.example.test/api/bootstrap?x=1',
+      'redirect keeps path + query on the configured HTTPS origin');
+
+    const viaHttps = await get('/api/bootstrap', { 'x-forwarded-proto': 'https' });
+    assert.strictEqual(viaHttps.status, 200, 'HTTPS visits are served');
+
+    const direct = await get('/api/bootstrap', {});
+    assert.strictEqual(direct.status, 200, 'direct local access (no proxy header) is served');
+  } finally {
+    if (child && child.exitCode == null && child.signalCode == null) {
+      child.kill('SIGKILL');
+      await waitExit(child, 3000).catch(() => {});
+    }
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

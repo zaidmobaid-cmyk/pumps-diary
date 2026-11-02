@@ -418,7 +418,7 @@ test('parseLayers / parseCurrentMap / parseNextMap / parseServerInfo: junk never
   assert.deepEqual(parser.parseLayers(''), []);
   assert.deepEqual(parser.parseLayers('List of available layers :'), []);
   assert.deepEqual(parser.parseLayers('header\n\n  \n\t\n'), []);
-  assert.deepEqual(parser.parseLayers('header\r\nA\r\n B (Mod) \r\n'), ['A', 'B (Mod)']);
+  assert.deepEqual(parser.parseLayers('header\r\nA\r\n B (Mod) \r\n'), ['A', 'B']);
   assert.deepEqual(parser.parseLayers(42), []); // one line, and the header line is skipped
   assert.deepEqual(parser.parseLayers('x'.repeat(70 * 1024)), []); // 70KB single line, no newline
 
@@ -426,8 +426,10 @@ test('parseLayers / parseCurrentMap / parseNextMap / parseServerInfo: junk never
     assert.equal(noThrow('parseCurrentMap', parser.parseCurrentMap, junk), null, short(junk));
     assert.equal(noThrow('parseNextMap', parser.parseNextMap, junk), null, short(junk));
   }
-  assert.deepEqual(parser.parseCurrentMap('Current level is , layer is '), { level: null, layer: null });
-  assert.deepEqual(parser.parseNextMap('Next level is To be voted, layer is To be voted'), { level: null, layer: null });
+  assert.deepEqual(parser.parseCurrentMap('Current level is , layer is '),
+    { level: null, layer: null, team1: null, team2: null });
+  assert.deepEqual(parser.parseNextMap('Next level is To be voted, layer is To be voted'),
+    { level: null, layer: null, team1: null, team2: null });
 
   for (const junk of ['', 'not json', '[1,2]', 'null', '"str"', '42', '{', '{"a":', null, undefined]) {
     assert.equal(noThrow('parseServerInfo', parser.parseServerInfo, junk), null, short(junk));

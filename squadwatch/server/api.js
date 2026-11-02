@@ -10,15 +10,24 @@
 // single-listener fanout, per-user/global caps, ping, viewer filtering),
 // §19.3.23 (viewer intel exclusions; audit admin+), §19.3.25 (security
 // headers + exact CSP), §19.3.26 (static serving rules), §19.3.27 (secret
-// redaction).
+// redaction). docs/NEXT-CONTRACTS.md: §1 (layers, factions, changeLayer),
+// §2 (quick commands), §3 (BattleMetrics wrappers, ban source/eosId).
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { log, sanitizeRconArg, parseInterval, clampInt } = require('./util');
 const { ACTION_NAMES, STEAM_ID_RE, INTERVAL_RE } = require('./admin');
 const { PERM_INFO } = require('./auth');
+const { splitFaction } = require('./parser');
+const { JOIN_FLAG_TYPES } = require('./joinalerts');
+const { NOT_SAVED } = require('./config');
 
 const BODY_LIMIT = 64 * 1024; // §13: JSON only, 64KB cap
+
+// Live evidence files attached to a ban row (BATCH3 §1); used inside ban SELECTs.
+const EVIDENCE_COUNT_SQL = `(SELECT COUNT(*) FROM evidence e
+        WHERE e.target_type = 'ban' AND e.target_id = b.id AND e.deleted_at IS NULL) AS evidence_count`;
 const COOKIE_NAME = 'sw_session';
 const COOKIE_MAX_AGE = 2592000; // 30 days, matches session TTL
 const CAP = 2000; // §19.3.21 "[all]" list cap
@@ -26,7 +35,7 @@ const CAP = 2000; // §19.3.21 "[all]" list cap
 // §19.3.25 — exact CSP, applied to HTML responses.
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' " +
   'https://fonts.googleapis.com; font-src https://fonts.gstatic.com; ' +
-  "img-src 'self' https: data:; connect-src 'self'; frame-ancestors 'none'";
+  "img-src 'self' https: data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'";
 
 // §19.3.26 — whitelisted extensions with an explicit MIME table.
 const MIME = {
@@ -41,9 +50,28 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
+// Every servable file under `dir` (MIME-listed extensions), keyed by its
+// resolved path, with a short content hash for cache-busting asset URLs.
+function snapshotStatic(dir) {
+  const files = new Map();
+  const walk = (d) => {
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, ent.name);
+      if (ent.isDirectory()) walk(full);
+      else if (ent.isFile() && MIME[path.extname(ent.name).toLowerCase()]) {
+        const buf = fs.readFileSync(full);
+        files.set(full, { buf, tag: crypto.createHash('sha256').update(buf).digest('hex').slice(0, 10) });
+      }
+    }
+  };
+  walk(dir);
+  return files;
+}
+
 // §19.3.27 — config paths whose values are redacted/scrubbed.
 const REDACT_PATHS = [
   'squad.rconPassword', 'log.ftp.password', 'log.sftp.password', 'steamApiKey', 'discordWebhook',
+  'battlemetrics.token', 'remoteBanList.key',
 ];
 const REDACTED = '•••'; // •••
 
@@ -60,7 +88,20 @@ const FLAGS_REVIEWED = Object.assign(Object.create(null), { 0: 'f.reviewed = 0',
 const BANS_ACTIVE = new Set(['1', '0', 'all']);
 const MATCH_OPS = Object.assign(Object.create(null), { restart: 'restartMatch', end: 'endMatch' });
 
-const UNBAN_NOTE = 'Ban deactivated in SquadWatch (join enforcement stops immediately). ' +
+// NEXT-CONTRACTS §1 — the built-in catalog GET /api/factions starts from;
+// every faction and unit type this server has shown is added to it.
+const VANILLA_FACTIONS = [
+  'ADF', 'BAF', 'CAF', 'IMF', 'INS', 'MEA', 'PLA', 'PLAAGF', 'PLANMC', 'RGF', 'TLF',
+  'USA', 'USMC', 'VDV', 'WPMC',
+];
+const UNIT_TYPES = [
+  'CombinedArms', 'LightInfantry', 'Mechanized', 'Motorized', 'Armored', 'Support',
+  'AirAssault', 'AmphibiousAssault', 'Combined',
+];
+// BattleMetrics ban-list ids are UUIDs; anything else never reaches its URL.
+const BM_LIST_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+const UNBAN_NOTE = 'Ban deactivated in A3 Admin (join enforcement stops immediately). ' +
   'Squad has no RCON unban command — if this ban was exported, remove the SteamID line from ' +
   'Bans.cfg on the game server (then AdminReloadServerConfig or wait for map change). ' +
   'If the player is currently online, nothing more to do.';
@@ -97,15 +138,22 @@ function utcDayStart(t) {
 }
 
 /**
- * createApi({db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version})
+ * createApi({db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version,
+ *            demoCli, runtime, battlemetrics})
  *   -> http.Server (caller listens; server.close() tears down SSE + bus wiring).
  */
 function createApi(deps) {
-  const { db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version, demoCli, runtime } = deps || {};
+  const {
+    db, state, ingest, rcon, bus, auth, admin, config, parserHealth, version, demoCli, runtime, battlemetrics,
+  } = deps || {};
   const cfg = config || {};
   const web = cfg.web || {};
   const trustProxy = web.trustProxy === true; // §19.3.19, default false
-  const pubDir = path.resolve(__dirname, '..', 'public');
+  const pubDir = path.resolve((deps && deps.publicDir) || path.join(__dirname, '..', 'public'));
+  // A live panel serves the public/ it booted with: files edited in this tree
+  // reach browsers only on restart, together with the server code they are
+  // written against. Without the option every request reads the disk.
+  const staticFiles = deps && deps.staticSnapshot === true ? snapshotStatic(pubDir) : null;
   const ph = parserHealth && typeof parserHealth.count24h === 'function'
     ? parserHealth : { count24h: () => 0, samples: () => [] };
   const AUDIT_ACTIONS = new Set([
@@ -115,6 +163,12 @@ function createApi(deps) {
     'role-create', 'role-update', 'role-delete',
     'invite-create', 'invite-revoke', 'invite-use',
     'settings-update', 'settings-test',
+    'quick-command', 'quick-commands-update', 'bm-import', 'ban-enforce',
+    // docs/BATCH3-CONTRACTS.md
+    'evidence-upload', 'evidence-delete', 'ban-note-update', 'templates-update',
+    'remote-bans-rotate', 'remote-bans-update',
+    'schedule-create', 'schedule-update', 'schedule-delete', 'scheduled-run',
+    'admin-call-reply', 'admin-call-handled', 'join-alert-kick',
   ]);
 
   // ------------------------------------------------------- secret redaction
@@ -339,8 +393,35 @@ function createApi(deps) {
       reviewNote: r.review_note == null ? null : r.review_note,
     };
   }
-  function banRow(nowT) {
+  // A ban-evasion flag names the banned account its player shares an IP
+  // with — an alt-account link, which only the `ips` permission may see.
+  function redactFlag(flag, user) {
+    if (!flag || flag.type !== 'ban-evasion' || auth.can(user, 'ips')) return flag;
+    const d = flag.details && typeof flag.details === 'object' ? flag.details : {};
+    return { ...flag, details: { reason: typeof d.reason === 'string' ? d.reason : 'Shares an IP address with a banned player', redacted: true } };
+  }
+  function flagRowsFor(user) {
+    return (r) => redactFlag(flagRow(r), user);
+  }
+  // Join alerts' auto-kick of an evader is audited with that same link (the
+  // banned account and its ban): in audit rows too, stored ones included,
+  // only `ips` sees it.
+  function auditDetailsFor(r, user) {
+    const details = parseDetails(r.details);
+    if (r.action !== 'join-alert-kick' || auth.can(user, 'ips')) return details;
+    const d = details && typeof details === 'object' ? details : {};
+    return {
+      flagId: d.flagId == null ? null : d.flagId,
+      reason: typeof d.reason === 'string' ? d.reason : null,
+      redacted: true,
+    };
+  }
+  // canSeeNotes: the private staff note (BATCH3 §2) only reaches roles that
+  // can ban — it may hold evidence links and alt intel.
+  function banRow(nowT, canSeeNotes) {
     return (r) => ({
+      ...(canSeeNotes ? { note: r.note == null ? null : r.note } : {}),
+      evidenceCount: r.evidence_count == null ? 0 : Number(r.evidence_count),
       id: r.id, playerId: r.player_id,
       playerName: r.player_name == null ? null : r.player_name,
       steamId: r.steam_id || r.p_steam || null,
@@ -351,6 +432,9 @@ function createApi(deps) {
       rconOk: r.rcon_ok == null ? null : !!r.rcon_ok,
       unbannedBy: r.unbanned_by == null ? null : r.unbanned_by,
       unbannedAt: r.unbanned_at == null ? null : r.unbanned_at,
+      // NEXT-CONTRACTS §3: null source = issued in this panel.
+      source: r.source == null ? null : r.source,
+      eosId: r.eos_id == null ? null : r.eos_id,
     });
   }
   function matchRowMap(r) {
@@ -386,8 +470,8 @@ function createApi(deps) {
   // ------------------------------------------------------------------- SSE
   // §19.3.22: ONE bus listener per event type fanning out to a Set of client
   // responses; max 4 streams/user, 64 global; ': ping' heartbeat every 25s;
-  // drop on write error/backpressure; viewers never get admin-channel chat
-  // or ADMIN_CAM data.
+  // drop on write error or a stalled client; viewers never get admin-channel
+  // chat or ADMIN_CAM data.
   const sse = {
     clients: new Set(), // { res, user }
     perUser: new Map(), // userId -> live stream count
@@ -403,9 +487,15 @@ function createApi(deps) {
     if (n <= 0) sse.perUser.delete(uid); else sse.perUser.set(uid, n);
     try { client.res.end(); } catch (_e) { /* already gone */ }
   }
+  // A stalled client must not grow server memory without bound, but write()
+  // returning false only means one frame passed the socket's 16 KB mark — the
+  // players snapshot of a full server alone does — so a healthy stream is
+  // dropped only once this much sits unsent.
+  const SSE_MAX_BUFFERED = 1024 * 1024;
   function sseWrite(client, text) {
     try {
-      if (!client.res.write(text)) dropClient(client); // backpressure -> drop
+      client.res.write(text);
+      if (client.res.writableLength > SSE_MAX_BUFFERED) dropClient(client);
     } catch (_e) {
       dropClient(client);
     }
@@ -415,13 +505,26 @@ function createApi(deps) {
     // (custom roles make "not a viewer" meaningless as a privilege test).
     if (event === 'chat' && data && data.channel === 'admin') return auth.can(client.user, 'adminChat');
     if (data && data.kind === 'ADMIN_CAM') return auth.can(client.user, 'adminChat');
+    // Admin calls and join alerts go to people who can act on them; join
+    // alerts may describe ban-evasion links.
+    if (event === 'admincall') return ['flags', 'warn', 'kick', 'ban'].some((p) => auth.can(client.user, p));
+    if (event === 'alert') return ['flags', 'ban'].some((p) => auth.can(client.user, p));
     return true;
   }
   function sseBroadcast(event, data) {
     if (sse.clients.size === 0) return;
+    const frame = (d) => `event: ${event}\ndata: ${JSON.stringify(d == null ? null : d)}\n\n`;
+    const full = frame(data);
+    const redactable = (event === 'flag' || event === 'alert') && data && data.type === 'ban-evasion';
+    let redacted = null;
     for (const client of [...sse.clients]) {
       if (!allowedFor(client, event, data)) continue;
-      sseWrite(client, `event: ${event}\ndata: ${JSON.stringify(data == null ? null : data)}\n\n`);
+      if (redactable && !auth.can(client.user, 'ips')) {
+        if (redacted == null) redacted = frame(redactFlag(data, client.user));
+        sseWrite(client, redacted);
+      } else {
+        sseWrite(client, full);
+      }
     }
   }
   function sendPlayersSnapshot() {
@@ -457,6 +560,9 @@ function createApi(deps) {
     ['log-status', (s) => { lastLogStatus = s; sseBroadcast('status', statusPayload()); }],
     ['broadcast', (p) => sseBroadcast('broadcast', p)],
     ['pop-sample', (p) => sseBroadcast('pop', p)],
+    // docs/BATCH3-CONTRACTS.md §6/§7: new and updated admin calls, join alerts.
+    ['admin-call', (p) => sseBroadcast('admincall', p)],
+    ['join-alert', (p) => sseBroadcast('alert', p)],
     ['squad-created', (p) => sseBroadcast('squad', Object.assign({ type: 'created' }, p))],
     ['squad-disbanded', (p) => sseBroadcast('squad', Object.assign({ type: 'disbanded' }, p))],
     ['squad-disbanded-admin', (p) => sseBroadcast('squad', Object.assign({ type: 'disbanded' }, p))],
@@ -508,17 +614,36 @@ function createApi(deps) {
   }
 
   // ---------------------------------------------------------- auth handlers
-  function hLogin(ctx) {
+  function tooManyAttempts(ctx, lim, message) {
+    ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
+    return json(ctx.res, 429, { error: message });
+  }
+
+  async function hLogin(ctx) {
     const lim = auth.loginLimiter.attempt(ctx.ip);
-    if (!lim.ok) {
-      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
-      return json(ctx.res, 429, { error: 'too many login attempts — try again shortly' });
-    }
+    if (!lim.ok) return tooManyAttempts(ctx, lim, 'too many login attempts — try again shortly');
     const username = strBody(ctx.body.username, 'username', { max: 64 });
     const password = strBody(ctx.body.password, 'password', { max: 1024 });
-    const user = auth.verifyLogin(username, password);
-    if (!user) return json(ctx.res, 401, { error: 'invalid username or password' });
-    auth.loginLimiter.reset(ctx.ip);
+    // A locked username gets this same 429 before any check, right password
+    // or not; unknown names lock exactly like real ones. Claimed before the
+    // await, so concurrent guesses cannot all pass a name one failure short
+    // of its lock.
+    const claim = auth.loginLimiter.claimUser(username);
+    if (!claim.ok) return tooManyAttempts(ctx, claim, 'too many login attempts — try again shortly');
+    let user;
+    try {
+      user = await auth.verifyLogin(username, password);
+    } catch (e) {
+      claim.release(); // verifyLogin resolves null for every failed check, so a throw is never one
+      if (!e || e.code !== 'ELOGINBUSY') throw e;
+      ctx.res.setHeader('Retry-After', String(e.retryAfterSec || 1));
+      return json(ctx.res, 503, { error: 'busy checking other sign-ins — try again in a moment' });
+    }
+    if (!user) {
+      claim.fail();
+      return json(ctx.res, 401, { error: 'invalid username or password' });
+    }
+    claim.succeed();
     const sess = auth.createSession(user.id, {
       ip: ctx.ip, ua: String(ctx.req.headers['user-agent'] || '').slice(0, 256),
     });
@@ -544,10 +669,7 @@ function createApi(deps) {
   }
   function hSetup(ctx) {
     const lim = auth.loginLimiter.attempt(ctx.ip); // rate-limited like login (§19.3.15)
-    if (!lim.ok) {
-      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
-      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
-    }
+    if (!lim.ok) return tooManyAttempts(ctx, lim, 'too many attempts — try again shortly');
     const username = strBody(ctx.body.username, 'username', { max: 64 });
     const password = strBody(ctx.body.password, 'password', { max: 1024 });
     const token = strBody(ctx.body.setupToken, 'setupToken', { max: 256 });
@@ -562,7 +684,6 @@ function createApi(deps) {
       return json(ctx.res, 400, { error: e.message });
     }
     auth.audit(user.id, 'setup', { details: { username: user.username, role: 'owner' } });
-    auth.loginLimiter.reset(ctx.ip);
     return json(ctx.res, 200, { ok: true });
   }
   function hMe(ctx) { return json(ctx.res, 200, { user: ctx.user }); }
@@ -589,7 +710,7 @@ function createApi(deps) {
     const flags = db.prepare(
       `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
         WHERE f.reviewed = 0 ORDER BY f.id DESC LIMIT 10`
-    ).all().map(flagRow);
+    ).all().map(flagRowsFor(ctx.user));
     return json(ctx.res, 200, {
       status: {
         rcon: rconStatus(), log: logStatusOut(),
@@ -771,7 +892,7 @@ function createApi(deps) {
       })(),
       flags: db.prepare(
         'SELECT f.*, NULL AS player_name FROM flags f WHERE f.player_id = ? ORDER BY f.id DESC LIMIT 2000'
-      ).all(id).map(flagRow),
+      ).all(id).map(flagRowsFor(ctx.user)),
       warnings: db.prepare(
         `SELECT w.id, w.player_id, w.by_user, w.time, w.message, w.auto, u.username AS by_username
            FROM warnings w LEFT JOIN users u ON u.id = w.by_user
@@ -781,10 +902,28 @@ function createApi(deps) {
         time: r.time, message: r.message, auto: !!r.auto,
       })),
       bans: db.prepare(
-        `SELECT b.*, NULL AS player_name, NULL AS p_steam, u.username AS issuer
+        `SELECT b.*, NULL AS player_name, NULL AS p_steam, u.username AS issuer,
+                ${EVIDENCE_COUNT_SQL}
            FROM bans b LEFT JOIN users u ON u.id = b.issued_by
           WHERE b.player_id = ? ORDER BY b.id DESC LIMIT 2000`
-      ).all(id).map(banRow(Date.now())),
+      ).all(id).map(banRow(Date.now(), auth.can(ctx.user, 'ban'))),
+      // Warn/kick/ban actions with their evidence counts, for people who act
+      // on or audit them (the audit log's row shape).
+      ...(['audit', 'warn', 'kick', 'ban'].some((p) => auth.can(ctx.user, p)) ? {
+        actions: db.prepare(
+          `SELECT a.id, a.time, a.action, a.details, a.rcon_ok, u.username,
+                  (SELECT COUNT(*) FROM evidence e WHERE e.target_type = 'action'
+                      AND e.target_id = a.id AND e.deleted_at IS NULL) AS evidence_count
+             FROM admin_actions a LEFT JOIN users u ON u.id = a.user_id
+            WHERE a.target_player_id = ? AND a.action IN ('warn', 'kick', 'ban')
+            ORDER BY a.id DESC LIMIT 500`
+        ).all(id).map((r) => ({
+          id: r.id, time: r.time, action: r.action, details: parseDetails(r.details),
+          username: r.username == null ? null : r.username,
+          rconOk: r.rcon_ok == null ? null : !!r.rcon_ok,
+          evidenceCount: r.evidence_count == null ? 0 : Number(r.evidence_count),
+        })),
+      } : {}),
       notes: db.prepare(
         `SELECT n.id, n.player_id, n.by_user, n.time, n.text, u.username AS by_username
            FROM player_notes n LEFT JOIN users u ON u.id = n.by_user
@@ -920,7 +1059,7 @@ function createApi(deps) {
     const flags = db.prepare(
       `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
         WHERE f.match_id = ? ORDER BY f.id LIMIT 2000`
-    ).all(id).map(flagRow);
+    ).all(id).map(flagRowsFor(ctx.user));
     return json(ctx.res, 200, { match: matchRowMap(m), scoreboard, kills, deployables, chat, flags });
   }
 
@@ -962,7 +1101,7 @@ function createApi(deps) {
       `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
         ${whereSql} ORDER BY f.id DESC LIMIT ? OFFSET ?`
     ).all(per, offset);
-    return json(ctx.res, 200, { total: totalRow ? Number(totalRow.c) : 0, rows: rows.map(flagRow) });
+    return json(ctx.res, 200, { total: totalRow ? Number(totalRow.c) : 0, rows: rows.map(flagRowsFor(ctx.user)) });
   }
 
   function hFlagReview(ctx) {
@@ -978,9 +1117,9 @@ function createApi(deps) {
 
   function hTrolls(ctx) {
     const weekAgo = Date.now() - 7 * 86400 * 1000;
-    const lb = (allSql, weekSql) => ({
-      all: db.prepare(allSql).all().map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
-      week: db.prepare(weekSql).all(weekAgo).map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
+    const lb = (allSql, weekSql, params = []) => ({
+      all: db.prepare(allSql).all(...params).map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
+      week: db.prepare(weekSql).all(weekAgo, ...params).map((r) => ({ id: r.id, name: r.name, value: Number(r.value) })),
     });
     // §19.1.8 — every leaderboard is {all, week}.
     const leaderboards = {
@@ -1002,31 +1141,90 @@ function createApi(deps) {
           WHERE k.teamkill = 1 AND k.kind = 'wound' AND k.time >= ?
           GROUP BY p.id, p.name ORDER BY value DESC, p.id LIMIT 20`
       ),
+      // Join alerts flag a connection, not behaviour (BATCH3 §6): rejoining
+      // never makes a repeat offender.
       repeatOffenders: lb(
         `SELECT p.id, p.name, COUNT(*) AS value FROM flags f JOIN players p ON p.id = f.player_id
+          WHERE f.type NOT IN (SELECT value FROM json_each(?))
           GROUP BY p.id, p.name HAVING COUNT(*) >= 2 ORDER BY value DESC, p.id LIMIT 20`,
         `SELECT p.id, p.name, COUNT(*) AS value FROM flags f JOIN players p ON p.id = f.player_id
-          WHERE f.time >= ? GROUP BY p.id, p.name HAVING COUNT(*) >= 2 ORDER BY value DESC, p.id LIMIT 20`
+          WHERE f.time >= ? AND f.type NOT IN (SELECT value FROM json_each(?))
+          GROUP BY p.id, p.name HAVING COUNT(*) >= 2 ORDER BY value DESC, p.id LIMIT 20`,
+        [JSON.stringify(JOIN_FLAG_TYPES)]
       ),
     };
     const openFlags = db.prepare(
       `SELECT f.*, p.name AS player_name FROM flags f LEFT JOIN players p ON p.id = f.player_id
         WHERE f.reviewed = 0 ORDER BY f.severity DESC, f.id DESC LIMIT 50`
-    ).all().map(flagRow);
+    ).all().map(flagRowsFor(ctx.user));
     return json(ctx.res, 200, { openFlags, leaderboards });
   }
 
+  // NEXT-CONTRACTS §1: `layers` stays plain names (now suffix-stripped and
+  // de-duplicated); `layerInfo` is the parallel {name, modId, level, mode, mod}.
   function hLayers(ctx) {
     return json(ctx.res, 200, {
       layers: state && Array.isArray(state.layers) ? state.layers : [],
+      layerInfo: state && Array.isArray(state.layerInfo) ? state.layerInfo : [],
       cachedAt: state && state.layersCachedAt != null ? state.layersCachedAt : null,
     });
   }
 
-  // -------------------------------------------------------------- bans
-  const BAN_SELECT = `SELECT b.*, p.name AS player_name, p.steam_id AS p_steam, u.username AS issuer
-      FROM bans b LEFT JOIN players p ON p.id = b.player_id LEFT JOIN users u ON u.id = b.issued_by`;
+  // NEXT-CONTRACTS §1: faction catalog (built-in ∪ seen), per-layer combos
+  // learned from the map pollers, and what the server shows right now.
+  function hFactions(ctx) {
+    const rows = db.prepare(
+      'SELECT layer, team1, team2, count, last_seen FROM layer_factions ORDER BY layer, count DESC, last_seen DESC'
+    ).all();
+    const combos = Object.create(null); // layer names are data: never prototype keys
+    const vanilla = new Set(VANILLA_FACTIONS);
+    const seenCodes = new Set();
+    const builtinTypes = new Set(UNIT_TYPES);
+    const seenTypes = new Set();
+    const note = (token) => {
+      if (!token) return;
+      const f = splitFaction(token);
+      if (f.code && !vanilla.has(f.code)) seenCodes.add(f.code);
+      if (f.type && !builtinTypes.has(f.type)) seenTypes.add(f.type);
+    };
+    for (const r of rows) {
+      (combos[r.layer] || (combos[r.layer] = [])).push({
+        team1: r.team1, team2: r.team2, count: Number(r.count) || 0,
+        lastSeen: r.last_seen == null ? null : Number(r.last_seen),
+      });
+      note(r.team1);
+      note(r.team2);
+    }
+    const slot = (m) => {
+      if (!m || !m.layer) return null;
+      note(m.team1);
+      note(m.team2);
+      return { layer: m.layer, team1: m.team1 == null ? null : m.team1, team2: m.team2 == null ? null : m.team2 };
+    };
+    const current = slot(state && state.currentMap);
+    const next = slot(state && state.nextMap);
+    return json(ctx.res, 200, {
+      known: VANILLA_FACTIONS.map((code) => ({ code, mod: false }))
+        .concat([...seenCodes].sort().map((code) => ({ code, mod: true }))),
+      types: UNIT_TYPES.concat([...seenTypes].sort()),
+      combos,
+      current,
+      next,
+    });
+  }
 
+  // -------------------------------------------------------------- bans
+  const BAN_SELECT = `SELECT b.*, p.name AS player_name, p.steam_id AS p_steam, u.username AS issuer,
+      ${EVIDENCE_COUNT_SQL}
+      FROM bans b LEFT JOIN players p ON p.id = b.player_id LEFT JOIN users u ON u.id = b.issued_by`;
+  // Bans between their duplicate check and their INSERT (the RCON await sits
+  // in between), by every id that check matches on: 'p:<player id>',
+  // 's:<SteamID>', 'e:<eos id>'.
+  const bansInFlight = new Set();
+
+  // §19.3.21 cap with total + truncated; rows newest first. Panel-issued bans
+  // (source NULL) fill the cap before imported ones, so a large BattleMetrics
+  // list can never push a panel ban, and its Unban button, off the page.
   function hBansList(ctx) {
     const key = ctx.query.get('active') || 'all';
     if (!BANS_ACTIVE.has(key)) throw new ApiErr(400, 'active must be 1, 0 or all');
@@ -1040,8 +1238,12 @@ function createApi(deps) {
       whereSql = ' WHERE (b.active = 0 OR (b.expires_at IS NOT NULL AND b.expires_at <= ?))';
       params.push(nowT);
     }
-    const rows = db.prepare(`${BAN_SELECT}${whereSql} ORDER BY b.id DESC LIMIT 2000`).all(...params);
-    return json(ctx.res, 200, { rows: rows.map(banRow(nowT)) });
+    const out = cappedAll(
+      `${BAN_SELECT}${whereSql} ORDER BY (b.source IS NOT NULL), b.id DESC`,
+      `SELECT COUNT(*) AS c FROM bans b${whereSql}`,
+      params, banRow(nowT, auth.can(ctx.user, 'ban')));
+    out.rows.sort((a, b) => b.id - a.id);
+    return json(ctx.res, 200, out);
   }
 
   async function hBanCreate(ctx) {
@@ -1051,6 +1253,9 @@ function createApi(deps) {
     const durationSec = parseInterval(intervalStr);
     if (durationSec == null) throw new ApiErr(400, 'invalid interval');
     const reason = sanitizeRconArg(body.reason == null ? '' : body.reason, 480);
+    // Private staff note: stored only, never sent over RCON, never in kick
+    // texts, Bans.cfg or the remote ban list.
+    const note = body.note == null ? '' : String(body.note).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, 2000);
     let playerRow = null;
     let steamIdParam = null;
     if (body.playerId != null && body.playerId !== '') {
@@ -1071,40 +1276,81 @@ function createApi(deps) {
       throw new ApiErr(400, 'playerId or steamId required');
     }
     const banSteamId = steamIdParam || playerRow.steam_id || null;
-    // RCON attempt (audited inside admin.js). Offline targets simply yield a
-    // "not found" style response -> rconOk=false, still recorded.
-    const rconRes = await admin.execAdmin(ctx.user, 'ban', {
-      playerId: playerRow.id,
-      steamId: steamIdParam || undefined,
-      interval: intervalStr,
-      reason: reason || 'Banned by admin',
-    });
-    const rconOk = rconRes.ok === true && rconRes.rconOk === true;
-    if (rconRes.ok !== true && rconRes.command == null) {
-      // Validation stopped the command before admin.js could audit it, but the
-      // DB ban below still takes effect (join enforcement) — audit it here.
-      auth.audit(ctx.user.id, 'ban', {
-        targetPlayerId: playerRow.id,
-        details: { interval: intervalStr, reason: reason || null, rconSkipped: rconRes.error || 'no usable selector' },
-      });
+    // One ban of a player at a time: a second one sent while the first still
+    // awaits RCON would pass the check below too and stack a duplicate.
+    const claim = [`p:${playerRow.id}`];
+    if (banSteamId) claim.push(`s:${banSteamId}`);
+    if (playerRow.eos_id) claim.push(`e:${String(playerRow.eos_id).toLowerCase()}`);
+    if (claim.some((k) => bansInFlight.has(k))) {
+      throw new ApiErr(409, `A ban for ${playerRow.name ? String(playerRow.name).trim() : 'this player'} is being sent right now — check the Bans page in a moment.`);
     }
-    const nowT = Date.now();
-    const expiresAt = durationSec === 0 ? null : nowT + durationSec * 1000;
-    const ins = db.prepare(
-      `INSERT INTO bans(player_id, steam_id, issued_by, issued_at, duration_sec, expires_at, reason, interval_raw, active, rcon_ok)
-       VALUES(?,?,?,?,?,?,?,?,1,?)`
-    ).run(playerRow.id, banSteamId, ctx.user.id, nowT, durationSec, expiresAt,
-      reason || null, intervalStr, rconOk ? 1 : 0);
-    const ban = {
-      id: ins.lastInsertRowid, playerId: playerRow.id, playerName: playerRow.name,
-      steamId: banSteamId, issuedBy: ctx.user.id, issuer: ctx.user.username,
-      issuedAt: nowT, durationSec, expiresAt, reason: reason || null,
-      intervalRaw: intervalStr, active: true, rconOk,
-    };
-    return json(ctx.res, 200, {
-      ok: true, ban, rconOk,
-      rconResponse: rconRes.ok ? rconRes.response : (rconRes.error || null),
-    });
+    // A ban that adds nothing — an active one already lasts as long, give or
+    // take a retry's worth of minutes — is refused before RCON, so pressing
+    // Ban again after "player not found" never stacks duplicates. A longer
+    // ban (1d -> perm) goes through and outranks the old one.
+    const checkT = Date.now();
+    const existing = db.prepare(
+      `SELECT b.expires_at, b.source, u.username AS issuer FROM bans b LEFT JOIN users u ON u.id = b.issued_by
+        WHERE b.active = 1 AND (b.expires_at IS NULL OR b.expires_at > ?)
+          AND (b.player_id = ? OR (b.steam_id IS NOT NULL AND b.steam_id = ?)
+               OR (b.eos_id IS NOT NULL AND lower(b.eos_id) = lower(?)))
+        ORDER BY (b.expires_at IS NULL) DESC, b.expires_at DESC LIMIT 1`
+    ).get(checkT, playerRow.id, banSteamId, playerRow.eos_id || null);
+    if (existing) {
+      const slack = Math.min(3600 * 1000, durationSec * 100); // 10%, at most an hour
+      const covered = existing.expires_at == null
+        || (durationSec !== 0 && Number(existing.expires_at) >= checkT + durationSec * 1000 - slack);
+      if (covered) {
+        const until = existing.expires_at == null ? 'permanently'
+          : `until ${new Date(Number(existing.expires_at)).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+        const by = existing.source === 'battlemetrics' ? ' (imported from BattleMetrics)'
+          : (existing.issuer ? ` by ${existing.issuer}` : '');
+        throw new ApiErr(409, `${playerRow.name ? String(playerRow.name).trim() : 'This player'} is already banned ${until}${by}. A3 Admin kicks them whenever they join.`);
+      }
+    }
+    for (const k of claim) bansInFlight.add(k);
+    try {
+      // RCON attempt (audited inside admin.js). Offline targets simply yield a
+      // "not found" style response -> rconOk=false, still recorded.
+      const rconRes = await admin.execAdmin(ctx.user, 'ban', {
+        playerId: playerRow.id,
+        steamId: steamIdParam || undefined,
+        interval: intervalStr,
+        reason: reason || 'Banned by admin',
+      });
+      const rconOk = rconRes.ok === true && rconRes.rconOk === true;
+      if (rconRes.ok !== true && rconRes.command == null) {
+        // Validation stopped the command before admin.js could audit it, but the
+        // DB ban below still takes effect (join enforcement) — audit it here.
+        auth.audit(ctx.user.id, 'ban', {
+          targetPlayerId: playerRow.id,
+          details: { interval: intervalStr, reason: reason || null, rconSkipped: rconRes.error || 'no usable selector' },
+        });
+      }
+      const nowT = Date.now();
+      const expiresAt = durationSec === 0 ? null : nowT + durationSec * 1000;
+      // eos_id too, so join enforcement matches the ban on either id.
+      const banEosId = playerRow.eos_id || null;
+      const ins = db.prepare(
+        `INSERT INTO bans(player_id, steam_id, eos_id, issued_by, issued_at, duration_sec, expires_at, reason, interval_raw, active, rcon_ok, note)
+         VALUES(?,?,?,?,?,?,?,?,?,1,?,?)`
+      ).run(playerRow.id, banSteamId, banEosId, ctx.user.id, nowT, durationSec, expiresAt,
+        reason || null, intervalStr, rconOk ? 1 : 0, note || null);
+      const ban = {
+        id: ins.lastInsertRowid, playerId: playerRow.id, playerName: playerRow.name,
+        steamId: banSteamId, issuedBy: ctx.user.id, issuer: ctx.user.username,
+        issuedAt: nowT, durationSec, expiresAt, reason: reason || null,
+        intervalRaw: intervalStr, active: true, rconOk, source: null, eosId: banEosId,
+        note: note || null, evidenceCount: 0,
+      };
+      return json(ctx.res, 200, {
+        ok: true, ban, rconOk,
+        rconResponse: rconRes.ok ? rconRes.response : (rconRes.error || null),
+        actionId: rconRes.auditId == null ? null : rconRes.auditId,
+      });
+    } finally {
+      for (const k of claim) bansInFlight.delete(k);
+    }
   }
 
   function hUnban(ctx) {
@@ -1154,13 +1400,13 @@ function createApi(deps) {
     const r = await doAdmin(ctx, 'warn', { playerId, message });
     db.prepare('INSERT INTO warnings(player_id, by_user, time, message, auto) VALUES(?,?,?,?,0)')
       .run(playerId, ctx.user.id, Date.now(), sanitizeRconArg(message, 480));
-    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response, actionId: r.auditId == null ? null : r.auditId });
   }
   async function hKick(ctx) {
     const playerId = intParam(ctx.body.playerId, 'playerId');
     const reason = strBody(ctx.body.reason, 'reason', { max: 480, required: false });
     const r = await doAdmin(ctx, 'kick', { playerId, reason });
-    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response, actionId: r.auditId == null ? null : r.auditId });
   }
   async function hBroadcast(ctx) {
     const message = strBody(ctx.body.message, 'message', { max: 480 });
@@ -1209,10 +1455,14 @@ function createApi(deps) {
     const r = await doAdmin(ctx, 'demoteCommander', { playerId: intParam(ctx.body.playerId, 'playerId') });
     return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
   }
+  // NEXT-CONTRACTS §1: body {layer, now, team1?, team2?}; the command is
+  // echoed so the UI can show exactly what the server was sent.
   async function hChangeLayer(ctx) {
     const layer = strBody(ctx.body.layer, 'layer', { max: 128 });
-    const r = await doAdmin(ctx, 'changeLayer', { layer, now: ctx.body.now === true });
-    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response });
+    const r = await doAdmin(ctx, 'changeLayer', {
+      layer, now: ctx.body.now === true, team1: ctx.body.team1, team2: ctx.body.team2,
+    });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response, command: r.command });
   }
   async function hMatchOp(ctx) {
     const op = String(ctx.body.op == null ? '' : ctx.body.op);
@@ -1233,6 +1483,141 @@ function createApi(deps) {
     return json(ctx.res, 200, { ok: true, response: r.response });
   }
 
+  // ------------------------------------------- quick commands (NEXT-CONTRACTS §2)
+
+  // Newest run per id that the game server accepted (rcon_ok = 1), from the
+  // audit log: {value, by, at}. A run whose exec failed or whose reply was
+  // refused never changed the server, so it never becomes the shown state.
+  function quickLast(rows) {
+    const last = {};
+    if (!rows.length) return last;
+    let found = [];
+    try {
+      found = db.prepare(
+        `SELECT a.time, a.details, u.username FROM admin_actions a
+           LEFT JOIN users u ON u.id = a.user_id
+          WHERE a.id IN (SELECT MAX(id) FROM admin_actions
+                          WHERE action = 'quick-command' AND rcon_ok = 1 AND json_valid(details)
+                          GROUP BY json_extract(details, '$.id'))`
+      ).all();
+    } catch (e) {
+      log.warn('api', `quick-command history unreadable: ${e.message}`);
+    }
+    const ids = new Set(rows.map((q) => q.id));
+    for (const r of found) {
+      const d = parseDetails(r.details);
+      if (!d || typeof d !== 'object' || !ids.has(d.id)) continue;
+      last[d.id] = {
+        value: d.value === 0 || d.value === 1 ? d.value : null,
+        by: r.username == null ? null : r.username,
+        at: r.time,
+      };
+    }
+    return last;
+  }
+
+  function hQuickList(ctx) {
+    const rows = admin.quickCommands();
+    return json(ctx.res, 200, { rows, last: quickLast(rows) });
+  }
+
+  // Runs through the admin layer: audited 'quick-command' with the response.
+  async function hQuickRun(ctx) {
+    const id = ctx.params[1];
+    if (!admin.quickCommands().some((q) => q.id === id)) throw new ApiErr(404, 'quick command not found');
+    const r = await doAdmin(ctx, 'quickCommand', { id, value: ctx.body.value });
+    return json(ctx.res, 200, { ok: true, rconOk: r.rconOk, rconResponse: r.response, command: r.command });
+  }
+
+  function hQuickReplace(ctx) {
+    const before = admin.quickCommands();
+    let rows;
+    try {
+      rows = admin.saveQuickCommands(ctx.body.rows);
+    } catch (e) {
+      throw new ApiErr(400, e.message);
+    }
+    const prev = new Map(before.map((q) => [q.id, q]));
+    const kept = new Set(rows.map((q) => q.id));
+    const same = (a, b) => a.label === b.label && a.command === b.command && a.toggle === b.toggle;
+    auth.audit(ctx.user.id, 'quick-commands-update', {
+      details: {
+        added: rows.filter((q) => !prev.has(q.id)),
+        changed: rows.filter((q) => prev.has(q.id) && !same(prev.get(q.id), q)),
+        removed: before.filter((q) => !kept.has(q.id)).map((q) => q.id),
+      },
+    });
+    return json(ctx.res, 200, { ok: true, rows });
+  }
+
+  // ------------------------------------- BattleMetrics (NEXT-CONTRACTS §3)
+  // Thin wrappers over deps.battlemetrics. Upstream failures surface as 502
+  // unless the module names a status; messages pass through the scrubber
+  // (the API token is a redacted secret).
+
+  function bm() {
+    if (!battlemetrics) throw new ApiErr(503, 'BattleMetrics import is unavailable');
+    return battlemetrics;
+  }
+  function bmError(e) {
+    const status = e && Number.isInteger(e.status) && e.status >= 400 && e.status <= 599 ? e.status : 502;
+    return new ApiErr(status, scrubText(e && e.message ? e.message : String(e)));
+  }
+
+  function hBmStatus(ctx) {
+    const mod = bm();
+    let out;
+    try { out = mod.status(); } catch (e) { throw bmError(e); }
+    return json(ctx.res, 200, scrubDeep(out || {}));
+  }
+
+  async function hBmBanLists(ctx) {
+    const mod = bm();
+    let lists;
+    try { lists = await mod.listBanLists(); } catch (e) { throw bmError(e); }
+    return json(ctx.res, 200, scrubDeep(Array.isArray(lists) ? lists : []));
+  }
+
+  // The saved list, read live (the Settings API edits config in place).
+  function savedBmList() {
+    const b = cfg.battlemetrics && typeof cfg.battlemetrics === 'object' ? cfg.battlemetrics : {};
+    return typeof b.banListId === 'string' ? b.banListId.trim() : '';
+  }
+
+  // Which list is enforced is a settings decision: a `ban` holder may re-sync
+  // the saved list, but only `settings` may name another one (its bans would
+  // be enforced at once).
+  async function hBmImport(ctx) {
+    const mod = bm();
+    const raw = ctx.body.banListId;
+    let banListId;
+    if (raw !== undefined && raw !== null && raw !== '') {
+      if (typeof raw !== 'string' || !BM_LIST_ID_RE.test(raw)) throw new ApiErr(400, 'invalid banListId');
+      banListId = raw;
+    }
+    if (banListId !== undefined && banListId !== savedBmList() && !auth.can(ctx.user, 'settings')) {
+      throw new ApiErr(403, 'importing a ban list other than the saved one needs the settings permission');
+    }
+    let out;
+    try {
+      out = await mod.importNow(banListId === undefined ? {} : { banListId });
+    } catch (e) {
+      const err = bmError(e);
+      auth.audit(ctx.user.id, 'bm-import', { details: { banListId: banListId || null, error: err.message } });
+      throw err;
+    }
+    const res = scrubDeep(out || {});
+    auth.audit(ctx.user.id, 'bm-import', {
+      details: {
+        banListId: banListId || null,
+        fetched: res.fetched, imported: res.imported, updated: res.updated,
+        deactivated: res.deactivated, skippedNoIdentifier: res.skippedNoIdentifier,
+        errors: Array.isArray(res.errors) ? res.errors.length : 0,
+      },
+    });
+    return json(ctx.res, 200, res);
+  }
+
   // ----------------------------------------------------------- audit, users
   function hAudit(ctx) {
     const q = ctx.query;
@@ -1250,7 +1635,9 @@ function createApi(deps) {
     const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
     const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM admin_actions a${whereSql}`).get(...params);
     const rows = db.prepare(
-      `SELECT a.*, u.username, p.name AS target_name
+      `SELECT a.*, u.username, p.name AS target_name,
+              (SELECT COUNT(*) FROM evidence e WHERE e.target_type = 'action'
+                  AND e.target_id = a.id AND e.deleted_at IS NULL) AS evidence_count
          FROM admin_actions a LEFT JOIN users u ON u.id = a.user_id
          LEFT JOIN players p ON p.id = a.target_player_id
         ${whereSql} ORDER BY a.id DESC LIMIT ? OFFSET ?`
@@ -1262,9 +1649,10 @@ function createApi(deps) {
         username: r.username == null ? null : r.username,
         action: r.action, targetPlayerId: r.target_player_id,
         targetName: r.target_name == null ? null : r.target_name,
-        details: parseDetails(r.details),
+        details: auditDetailsFor(r, ctx.user),
         rconCommand: r.rcon_command, rconResponse: r.rcon_response,
         rconOk: r.rcon_ok == null ? null : !!r.rcon_ok,
+        evidenceCount: r.evidence_count == null ? 0 : Number(r.evidence_count),
       })),
     });
   }
@@ -1342,6 +1730,8 @@ function createApi(deps) {
     }
     if (body.password !== undefined) {
       const pw = strBody(body.password, 'password', { max: 1024 });
+      const weak = auth.passwordProblem(pw);
+      if (weak) throw new ApiErr(400, weak);
       sets.push('pass_hash = ?'); params.push(auth.hashPassword(pw)); changed.push('password');
     }
     if (!sets.length) throw new ApiErr(400, 'nothing to update');
@@ -1509,10 +1899,7 @@ function createApi(deps) {
   // non-claimable state (no oracle).
   function hJoinPeek(ctx) {
     const lim = auth.loginLimiter.attempt(ctx.ip);
-    if (!lim.ok) {
-      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
-      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
-    }
+    if (!lim.ok) return tooManyAttempts(ctx, lim, 'too many attempts — try again shortly');
     const inv = auth.findInvite(String(ctx.query.get('token') || ''));
     if (!inv) return json(ctx.res, 200, { valid: false });
     return json(ctx.res, 200, {
@@ -1524,10 +1911,7 @@ function createApi(deps) {
 
   function hJoin(ctx) {
     const lim = auth.loginLimiter.attempt(ctx.ip);
-    if (!lim.ok) {
-      ctx.res.setHeader('Retry-After', String(lim.retryAfterSec || 60));
-      return json(ctx.res, 429, { error: 'too many attempts — try again shortly' });
-    }
+    if (!lim.ok) return tooManyAttempts(ctx, lim, 'too many attempts — try again shortly');
     const token = strBody(ctx.body.token, 'token', { max: 256 });
     const username = strBody(ctx.body.username, 'username', { max: 64 });
     const password = strBody(ctx.body.password, 'password', { max: 1024 });
@@ -1537,7 +1921,6 @@ function createApi(deps) {
     } catch (e) {
       return json(ctx.res, 400, { error: e.message });
     }
-    auth.loginLimiter.reset(ctx.ip);
     auth.audit(null, 'invite-use', {
       details: { inviteId: claimed.inviteId, userId: claimed.user.id, username: claimed.user.username, role: claimed.user.role },
     });
@@ -1570,6 +1953,7 @@ function createApi(deps) {
         sftpPassword: !!(cfg.log && cfg.log.sftp && cfg.log.sftp.password),
         steamApiKey: !!cfg.steamApiKey,
         discordWebhook: !!cfg.discordWebhook,
+        battlemetricsToken: !!(cfg.battlemetrics && cfg.battlemetrics.token),
       },
       demo: demoCli === true,
       linked: !!(cfg.squad && cfg.squad.rconHost),
@@ -1596,10 +1980,14 @@ function createApi(deps) {
       // Validation messages already redact secret values (config.js §19.3.27).
       throw new ApiErr(400, scrubText(e.message));
     }
+    // Roles without `settings` read the audit log: a failed config.json
+    // write is recorded as a marker; its text (OS message, paths) goes to
+    // the caller only, scrubbed.
     auth.audit(ctx.user.id, 'settings-update', {
-      details: { changed: out.changedPaths, persistError: out.persistError || null },
+      details: { changed: out.changedPaths, persistError: out.persistError ? NOT_SAVED : null },
     });
-    return json(ctx.res, 200, { ok: true, changed: out.changedPaths, persistError: out.persistError || null });
+    const persistError = out.persistError ? scrubText(String(out.persistError)) : null;
+    return json(ctx.res, 200, { ok: true, changed: out.changedPaths, persistError });
   }
 
   // POST /api/settings/test — one-shot probes with candidate values, never
@@ -1655,6 +2043,7 @@ function createApi(deps) {
   route('POST', /^\/api\/flags\/(\d+)\/review$/, { perm: 'flags' }, hFlagReview);
   route('GET', /^\/api\/trolls$/, { perm: 'view' }, hTrolls);
   route('GET', /^\/api\/layers$/, { perm: 'view' }, hLayers);
+  route('GET', /^\/api\/factions$/, { perm: 'layer' }, hFactions);
   route('GET', /^\/api\/bans$/, { perm: 'view' }, hBansList);
   route('POST', /^\/api\/bans$/, { perm: 'ban' }, hBanCreate);
   route('POST', /^\/api\/bans\/(\d+)\/unban$/, { perm: 'ban' }, hUnban);
@@ -1670,6 +2059,12 @@ function createApi(deps) {
   route('POST', /^\/api\/admin\/match$/, { perm: 'match' }, hMatchOp);
   route('POST', /^\/api\/admin\/slomo$/, { perm: 'slomo' }, hSlomo);
   route('POST', /^\/api\/admin\/raw$/, { perm: 'raw' }, hRaw);
+  route('GET', /^\/api\/quick-commands$/, { anyPerm: ['quickcmd', 'raw', 'settings'] }, hQuickList);
+  route('POST', /^\/api\/quick-commands$/, { perm: 'settings' }, hQuickReplace);
+  route('POST', /^\/api\/quick-commands\/([a-z0-9-]{1,40})\/run$/, { perm: 'quickcmd' }, hQuickRun);
+  route('GET', /^\/api\/battlemetrics\/status$/, { perm: 'settings' }, hBmStatus);
+  route('GET', /^\/api\/battlemetrics\/ban-lists$/, { perm: 'settings' }, hBmBanLists);
+  route('POST', /^\/api\/battlemetrics\/import$/, { anyPerm: ['settings', 'ban'] }, hBmImport);
   route('GET', /^\/api\/audit$/, { perm: 'audit' }, hAudit); // §19.3.23: admin+
   route('GET', /^\/api\/users$/, { perm: 'users' }, hUsersList);
   route('POST', /^\/api\/users$/, { perm: 'users' }, hUserCreate);
@@ -1687,6 +2082,18 @@ function createApi(deps) {
   route('GET', /^\/api\/settings$/, { perm: 'settings' }, hSettings);
   route('POST', /^\/api\/settings$/, { perm: 'settings' }, hSettingsUpdate);
   route('POST', /^\/api\/settings\/test$/, { perm: 'settings' }, hSettingsTest);
+
+  // Feature modules (docs/BATCH3-CONTRACTS.md: evidence, reason templates,
+  // remote ban list, scheduler, admin calls, join alerts) register their own
+  // routes against these shared helpers. Route opts as above, plus
+  // { rawBody: true } for streaming uploads.
+  const extApi = {
+    route, json, ApiErr, strBody, intParam, clampInt, scrubText, sseBroadcast,
+    cappedAll, doAdmin, auth, db, state, bus, admin, cfg,
+  };
+  for (const ext of (deps && deps.extensions) || []) {
+    if (ext && typeof ext.registerRoutes === 'function') ext.registerRoutes(extApi);
+  }
 
   // ------------------------------------------------------------ static files
   async function serveStatic(req, res, pathname) {
@@ -1707,10 +2114,36 @@ function createApi(deps) {
     const mime = MIME[ext];
     if (!mime) return json(res, 404, { error: 'not found' });
     let buf;
-    try {
-      buf = await fs.promises.readFile(resolved);
-    } catch (_e) {
-      return json(res, 404, { error: 'not found' });
+    if (staticFiles) {
+      const f = staticFiles.get(resolved);
+      if (!f) return json(res, 404, { error: 'not found' });
+      buf = f.buf;
+    } else {
+      try {
+        buf = await fs.promises.readFile(resolved);
+      } catch (_e) {
+        return json(res, 404, { error: 'not found' });
+      }
+    }
+    // Proxies (Cloudflare's default browser TTL is 4h) can pin old JS/CSS in
+    // browsers regardless of our no-cache. Stamp each local asset URL in the
+    // HTML with its content hash (or mtime) so every change is a new URL the
+    // cache never saw.
+    if (ext === '.html') {
+      const html = buf.toString('utf8').replace(
+        /\b(src|href)="((?:css\/|brand\/)?[\w.-]+\.(?:js|css|png|svg|ico|webmanifest))"/g,
+        (m, attr, rel) => {
+          if (staticFiles) {
+            const f = staticFiles.get(path.join(pubDir, rel));
+            return f ? `${attr}="${rel}?v=${f.tag}"` : m;
+          }
+          try {
+            const st = fs.statSync(path.join(pubDir, rel));
+            return `${attr}="${rel}?v=${Math.floor(st.mtimeMs).toString(36)}"`;
+          } catch (_e) { return m; }
+        }
+      );
+      buf = Buffer.from(html, 'utf8');
     }
     res.setHeader('Content-Type', mime);
     res.setHeader('Cache-Control', 'no-cache');
@@ -1721,9 +2154,43 @@ function createApi(deps) {
   }
 
   // --------------------------------------------------------------- dispatch
+  // First X-Forwarded-Proto value; '' unless the proxy is trusted.
+  function forwardedProto(req) {
+    if (!trustProxy) return '';
+    return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  }
+  // Base URL a plain-HTTP visit is sent to: web.publicUrl when it is an https
+  // URL (read per request — the Settings API can change it), else the
+  // visitor's own Host over https. null when that Host is not a bare
+  // hostname[:port], so a forged Host can never shape the Location.
+  function httpsBase(req) {
+    try {
+      const u = new URL(String(web.publicUrl || ''));
+      if (u.protocol === 'https:') return u.origin + u.pathname.replace(/\/+$/, '');
+    } catch (_e) { /* blank or malformed publicUrl: use the Host header */ }
+    const host = String(req.headers.host || '');
+    return /^[A-Za-z0-9.-]+(:\d+)?$/.test(host) ? `https://${host}` : null;
+  }
+
   async function handle(req, res) {
     res.setHeader('X-Content-Type-Options', 'nosniff'); // §19.3.25 on every response
     res.setHeader('Referrer-Policy', 'no-referrer');
+    const proto = forwardedProto(req);
+    // A visitor who reached the trusted proxy over plain HTTP never gets the
+    // panel there (passwords would cross the internet unencrypted) — whatever
+    // web.publicUrl says, so blanking it cannot reopen cleartext logins.
+    if (proto === 'http') {
+      const base = httpsBase(req);
+      if (!base) return json(res, 400, { error: 'bad Host header' });
+      res.writeHead(308, { Location: base + (req.url && req.url.startsWith('/') ? req.url : '/'), 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+    // HSTS only on responses that really travelled over HTTPS. No
+    // includeSubDomains or preload: both would commit hosts other than this
+    // panel to HTTPS, which is not this server's call.
+    if (proto === 'https' || (req.socket && req.socket.encrypted)) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+    }
     let url;
     try {
       url = new URL(req.url, 'http://internal');
@@ -1768,7 +2235,14 @@ function createApi(deps) {
             : auth.can(ctx.user, matched.opts.perm || 'view');
           if (!allowed) return json(res, 403, { error: 'forbidden' });
         }
-        if (req.method === 'POST') {
+        if (req.method === 'POST' && matched.opts.rawBody) {
+          // Streaming upload route (evidence): the handler reads ctx.req and
+          // enforces its own size and type limits. CSRF still applies; the
+          // JSON-only Content-Type rule does not.
+          const csrfErr = csrfCheck(req);
+          if (csrfErr) return json(res, 403, { error: `request blocked: ${csrfErr}` });
+          ctx.body = null;
+        } else if (req.method === 'POST') {
           // §19.3.20 — CSRF + Content-Type on every mutating route.
           const csrfErr = csrfCheck(req);
           if (csrfErr) return json(res, 403, { error: `request blocked: ${csrfErr}` });
@@ -1809,6 +2283,10 @@ function createApi(deps) {
       }
     });
   });
+
+  // Evidence uploads (up to evidence.maxMB) over a slow uplink outlast Node's
+  // 5-minute whole-request default.
+  server.requestTimeout = 20 * 60 * 1000;
 
   // Teardown: detach bus listeners, stop timers, drop SSE clients, and make
   // sure long-lived SSE sockets do not keep server.close() hanging forever.

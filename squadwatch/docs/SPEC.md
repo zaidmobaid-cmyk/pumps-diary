@@ -520,10 +520,13 @@ GET  /api/chat?q=&channel=&playerId=&page=&per=100 → {total, rows:[{time,chann
 GET  /api/flags?reviewed=0|1|all&page= → {total, rows:[flag + player name]}
 POST /api/flags/:id/review {note?} → {ok}             (admin)
 GET  /api/trolls → {openFlags, leaderboards:{teamkills:{all:[…],week:[…]},
-      radioFriendly:[…], tkDeaths:[…], repeatOffenders:[players w/ >=2 flags]}}
+      radioFriendly:[…], tkDeaths:[…], repeatOffenders:[players w/ >=2 flags, join-alert
+      flags (watchlist-join, flagged-join, ban-evasion) not counted]}}
 GET  /api/layers → {layers:[…], cachedAt}
 GET  /api/bans?active=1|0|all → {rows:[ban + player name + issuer]}
 POST /api/bans {playerId|steamId, interval, reason} → {ok, ban, rconOk, rconResponse} (admin)
+      409, nothing sent over RCON: an active ban on the player (player id, SteamID or EOS
+      id) already lasts as long, or another ban of the player is still awaiting RCON
 POST /api/bans/:id/unban → {ok, note:"…Bans.cfg…"}    (admin; sets active=0; NOTE: Squad
       has no RCON unban — response includes guidance string; if player online nothing to do)
 GET  /api/export/bans.cfg → text/plain lines "SteamId:ExpiryEpoch //reason" for active bans (admin)

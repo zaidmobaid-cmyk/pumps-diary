@@ -1,20 +1,40 @@
 'use strict';
 // Live server state (SPEC §10 + §19.1.1). Holds what is true RIGHT NOW on the
 // game server: online players, squads, layer info, the open match. Ingest and
-// the pollers write into it; api.js reads snapshot() for SSE/overview.
+// the pollers write into it; api.js reads snapshot() for SSE/overview; ingest
+// listens for the roster-* events (ListPlayers-diff joins/leaves) directly.
 //
 // §19.1.1 / §19.3: snapshot() and every SSE payload built from it NEVER carry
 // `ip` or `controller` — those stay inside the live records (profile IPs are
 // served separately to admin+ from the DB).
 const { EventEmitter } = require('node:events');
+const { layerInfo } = require('./parser');
 
 // A player that joined via log events but was not yet seen by a ListPlayers
 // poll (playerId still null) survives one reconcile window, so a poll response
 // generated just before the join cannot evict a genuinely connected player.
 const JOIN_GRACE_MS = 60 * 1000;
 
+// Roster-diff joins/leaves (see _diffRoster). A player must be missing from
+// two consecutive polls to count as gone — one glitchy poll is not a leave.
+// Half or more of a roster of MASS_VANISH_MIN+ vanishing in one poll is map
+// travel or a broken poll, not a mass exodus: those absences wait this long
+// before they count, and whoever reappears meanwhile never left. Absences in
+// the polls right after a map change wait the same way.
+const ROSTER_HOLD_MS = 3 * 60 * 1000;
+const MASS_VANISH_MIN = 4;
+
 function lower(s) {
   return s == null ? null : String(s).toLowerCase();
+}
+
+// Payload of the roster-* events.
+function rosterEvent(e, time) {
+  const n = (v) => (v === undefined || v === null ? null : v);
+  return {
+    time, eosId: e.eosId, steamId: n(e.steamId), name: n(e.name),
+    teamId: n(e.teamId), playerId: n(e.playerId),
+  };
 }
 
 function blankRecord(eosId, now) {
@@ -75,15 +95,38 @@ class LiveState extends EventEmitter {
     this._lastWorldResetAt = 0;
     /** parsed ShowServerInfo (§6.4) or null */
     this.serverInfo = null;
-    /** cached ListLayers names */
+    /** cached ListLayers: suffix-stripped names, and one LayerInfo
+     *  {name, modId, level, mode, mod} per name (docs/NEXT-CONTRACTS.md §1) */
     this.layers = [];
+    this.layerInfo = [];
+    this.layersCachedAt = null;
     this.currentLayer = null;
     this.nextLayer = null;
+    /** last ShowCurrentMap / ShowNextMap reply: {layer, level, team1, team2} */
+    this.currentMap = null;
+    this.nextMap = null;
+    /** faction-combo learning (applyMapInfo): the combo each slot showed last,
+     *  and the combos recently queued as next */
+    this._comboKey = { current: null, next: null };
+    this._recentNextKeys = [];
     this.tickRate = null;
     /** current match row ref {id, layer, level, team1, team2, startedAt} (ingest owns it) */
     this.match = null;
     /** parsed "Recently Disconnected" rows from the last ListPlayers poll */
     this.recentlyDisconnected = [];
+    /** Map<eosId, entry> — who the ListPlayers polls say is connected: the
+     *  basis of roster-joined/roster-left. Kept apart from `players`, which
+     *  the log path also writes. entry: {eosId, steamId, name, teamId,
+     *  playerId, lastSeenAt, missedAt (first poll without them), leftAt (their
+     *  leave stamp), holdUntil} */
+    this._roster = new Map();
+    /** 'boot' | 'reconnect' | null — the next ListPlayers only re-establishes
+     *  the roster: nobody already online joined, nobody missing has left yet */
+    this._rosterBaseline = 'boot';
+    /** when the RCON link dropped; absences the reconnect poll finds date from here */
+    this._rosterLostAt = null;
+    /** no roster leave is confirmed before this (map travel) */
+    this._rosterGraceUntil = 0;
   }
 
   // ------------------------------------------------------------- lookups
@@ -158,19 +201,19 @@ class LiveState extends EventEmitter {
   // ------------------------------------------------------------- apply polls
 
   // Reconcile the live map against a parsed ListPlayers response (§6.4).
-  // Log events are the primary join/leave source; the poll updates
-  // team/squad/name/playerId, creates missed joins as a fallback, and prunes
-  // players the server no longer lists (with a short grace window for
-  // log-joined players the poll may predate).
-  applyListPlayers(parsed) {
+  // The poll updates team/squad/name/playerId, creates missed joins as a
+  // fallback, and prunes players the server no longer lists (with a short
+  // grace window for log-joined players the poll may predate). It is also the
+  // join/leave source while no game log is linked: see _diffRoster.
+  // `now` is injectable so tests can drive a poll timeline.
+  applyListPlayers(parsed, now = Date.now()) {
     if (!parsed || !Array.isArray(parsed.online)) return;
-    const now = Date.now();
-    const seen = new Set();
+    const seen = new Map(); // eos -> its row (the last one wins, as below)
 
     for (const row of parsed.online) {
       const eos = lower(row.eosId);
       if (!eos) continue; // cannot key a record without an EOS id
-      seen.add(eos);
+      seen.set(eos, row);
       let rec = this.players.get(eos);
       if (!rec) {
         rec = blankRecord(eos, now); // fallback join detection
@@ -204,7 +247,89 @@ class LiveState extends EventEmitter {
       }))
       : [];
 
+    this._diffRoster(seen, now);
     this.emit('players-updated');
+  }
+
+  // Joins and leaves from consecutive ListPlayers polls — Squad's RCON event
+  // stream has no connect/disconnect events. Emits 'roster-joined' and
+  // 'roster-left' {time, eosId, steamId, name, teamId, playerId}; a leave also
+  // carries lastSeenAt/missedAt, the window the player actually left in. A
+  // baseline poll emits only 'roster-baseline' {time, reason, players}.
+  _diffRoster(seen, now) {
+    // An empty boot roster while ShowServerInfo (polled just before it)
+    // counts players is a garbled reply, not an empty server: the baseline
+    // waits for a real one, or the next good poll would announce everyone.
+    if (this._rosterBaseline === 'boot' && seen.size === 0
+      && this.serverInfo && Number(this.serverInfo.playerCount) > 0) return;
+    const baseline = this._rosterBaseline;
+    const lostAt = this._rosterLostAt;
+    this._rosterBaseline = null;
+    this._rosterLostAt = null;
+
+    let listed = 0;
+    let vanished = 0;
+    for (const [eos, e] of this._roster) {
+      if (e.missedAt != null) continue;
+      listed++;
+      if (!seen.has(eos)) vanished++;
+    }
+    const massVanish = listed >= MASS_VANISH_MIN && vanished * 2 >= listed;
+
+    const joined = [];
+    for (const [eos, row] of seen) {
+      let e = this._roster.get(eos);
+      if (!e) {
+        // A mass-vanish poll announces nobody; its newcomers join on the next.
+        if (massVanish && !baseline) continue;
+        e = { eosId: eos };
+        this._roster.set(eos, e);
+        if (!baseline) joined.push(e);
+      }
+      e.steamId = row.steamId ? String(row.steamId) : (e.steamId || null);
+      e.name = row.name || e.name || null;
+      e.teamId = row.teamId != null ? row.teamId : null;
+      e.playerId = row.playerId != null ? row.playerId : null;
+      e.lastSeenAt = now;
+      e.missedAt = null; // listed again: a pending absence never happened
+      e.leftAt = null;
+      e.holdUntil = 0;
+    }
+
+    const left = [];
+    for (const [eos, e] of this._roster) {
+      if (seen.has(eos)) continue;
+      if (e.missedAt == null) {
+        e.missedAt = now;
+        // Missing after an RCON outage: they left while we were blind, so
+        // the leave dates from when sight was lost, not from the reconnect.
+        e.leftAt = baseline === 'reconnect' && lostAt != null
+          ? Math.min(now, Math.max(e.lastSeenAt, lostAt)) : now;
+        e.holdUntil = massVanish ? now + ROSTER_HOLD_MS : 0;
+        continue;
+      }
+      if (baseline || massVanish || now < e.holdUntil || now < this._rosterGraceUntil) continue;
+      this._roster.delete(eos);
+      left.push(e);
+    }
+
+    for (const e of joined) this.emit('roster-joined', rosterEvent(e, now));
+    for (const e of left) {
+      this.emit('roster-left', Object.assign(rosterEvent(e, e.leftAt), {
+        lastSeenAt: e.lastSeenAt, missedAt: e.missedAt,
+      }));
+    }
+    if (baseline) {
+      const players = [];
+      for (const eos of seen.keys()) players.push(rosterEvent(this._roster.get(eos), now));
+      this.emit('roster-baseline', { time: now, reason: baseline, players });
+    }
+  }
+
+  // Map travel: players stay connected through it, so no roster leave is
+  // confirmed until the new map has settled.
+  _holdRosterLeaves(now = Date.now()) {
+    this._rosterGraceUntil = Math.max(this._rosterGraceUntil, now + ROSTER_HOLD_MS);
   }
 
   applyListSquads(rows) {
@@ -238,6 +363,7 @@ class LiveState extends EventEmitter {
       this._pendingCreations.clear();
       this._suppressDisbandUntil = Date.now() + 30000;
       this._lastWorldResetAt = Date.now();
+      this._holdRosterLeaves();
       this.emit('squads-updated');
       return;
     }
@@ -294,7 +420,7 @@ class LiveState extends EventEmitter {
   }
 
   // NEW_GAME: every squad dissolves with the map — clear without emitting
-  // a storm of 'squad-disbanded' events.
+  // a storm of 'squad-disbanded' events. Players do NOT leave with it.
   clearSquadsForNewGame() {
     // The same transition arrives up to three ways (poll wipe, NEW_GAME line,
     // serverinfo echo); only the first one resets — later echoes would wipe
@@ -305,6 +431,7 @@ class LiveState extends EventEmitter {
     this.squadCreations.clear();
     this._pendingCreations.clear();
     this._suppressDisbandUntil = Date.now() + 30000;
+    this._holdRosterLeaves();
     this.emit('squads-updated');
   }
 
@@ -322,10 +449,58 @@ class LiveState extends EventEmitter {
     this.emit('serverinfo-updated', info);
   }
 
-  // Called when the RCON link drops: squads may change arbitrarily while we
-  // are blind, so the next poll must not be read as disbands.
-  noteRconDown() {
+  // ListLayers poll (parser.parseLayerList rows). An empty reply is a failed
+  // poll, not a server without layers: the previous cache stays.
+  applyLayers(entries, now = Date.now()) {
+    if (!Array.isArray(entries) || entries.length === 0) return false;
+    this.layers = entries.map((e) => e.name);
+    this.layerInfo = entries.map((e) => layerInfo(e.name, e.modId));
+    this.layersCachedAt = now;
+    return true;
+  }
+
+  // A parsed ShowCurrentMap ('current') or ShowNextMap ('next') reply. Returns
+  // the faction combo to record, {layer, team1, team2, fresh}, or null when the
+  // reply names no layer or no faction pair. `fresh` = a new appearance, to be
+  // counted; a repeat poll of the same combo only refreshes its last-seen. A
+  // combo turning current after it was queued as next is the round already
+  // counted when it was queued — once: going live consumes the queued mark.
+  applyMapInfo(slot, parsed) {
+    if ((slot !== 'current' && slot !== 'next') || !parsed) return null;
+    const n = (v) => (v === undefined || v === null || v === '' ? null : v);
+    const info = n(parsed.layer) == null ? null : {
+      layer: parsed.layer, level: n(parsed.level), team1: n(parsed.team1), team2: n(parsed.team2),
+    };
+    if (slot === 'current') this.currentMap = info;
+    else this.nextMap = info;
+    const key = info && info.team1 && info.team2 ? `${info.layer}\n${info.team1}\n${info.team2}` : null;
+    const prev = this._comboKey[slot];
+    this._comboKey[slot] = key;
+    if (!key) return null;
+    let fresh = key !== prev;
+    if (slot === 'next') {
+      if (fresh) {
+        this._recentNextKeys.push(key);
+        if (this._recentNextKeys.length > 4) this._recentNextKeys.shift();
+      }
+    } else if (fresh) {
+      const queued = this._recentNextKeys.indexOf(key);
+      if (queued >= 0) {
+        this._recentNextKeys.splice(queued, 1);
+        fresh = false;
+      }
+    }
+    return { layer: info.layer, team1: info.team1, team2: info.team2, fresh };
+  }
+
+  // Called when the RCON link drops: squads and players may change
+  // arbitrarily while we are blind, so the next polls must not be read as
+  // disbands, joins or leaves. Repeated drops before a successful poll keep
+  // the first stamp.
+  noteRconDown(now = Date.now()) {
     this._skipNextSquadDiff = true;
+    if (this._rosterBaseline !== 'boot') this._rosterBaseline = 'reconnect';
+    if (this._rosterLostAt == null) this._rosterLostAt = now;
   }
 
   // ------------------------------------------------------------- snapshot

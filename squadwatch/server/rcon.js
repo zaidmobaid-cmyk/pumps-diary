@@ -1,5 +1,5 @@
 'use strict';
-// SquadWatch — Source RCON client with Squad quirks (docs/SPEC.md §4).
+// A3 Admin — Source RCON client with Squad quirks (docs/SPEC.md §4).
 // Zero npm dependencies: node:net + node:events only.
 //
 // Wire format (§4.1): [int32LE size][int32LE id][int32LE type][body utf8][0x00][0x00]

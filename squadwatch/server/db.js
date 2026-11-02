@@ -7,7 +7,7 @@ const path = require('node:path');
 const { log } = require('./util');
 
 const FRIENDLY_BACKEND_ERROR =
-  'No SQLite backend available. SquadWatch uses the built-in node:sqlite module — ' +
+  'No SQLite backend available. A3 Admin uses the built-in node:sqlite module — ' +
   'upgrade Node to >=22.13, or install the optional fallback with: npm install better-sqlite3';
 
 function pickBackend() {
@@ -139,6 +139,92 @@ CREATE TABLE squad_events(
 CREATE INDEX idx_squad_events_match ON squad_events(match_id);
 CREATE INDEX idx_squad_events_time ON squad_events(time);
 `;
+
+// v5 — imported ban lists (BattleMetrics) match on EOS as well as Steam and
+// remember where each ban came from; faction pairings are learned per layer
+// from ShowCurrentMap/ShowNextMap (docs/NEXT-CONTRACTS.md).
+const DDL_V5 = `
+ALTER TABLE bans ADD COLUMN eos_id TEXT;
+ALTER TABLE bans ADD COLUMN source TEXT;
+ALTER TABLE bans ADD COLUMN external_id TEXT;
+CREATE INDEX idx_bans_eos ON bans(eos_id);
+CREATE INDEX idx_bans_steam ON bans(steam_id);
+CREATE UNIQUE INDEX idx_bans_source_ext ON bans(source, external_id) WHERE external_id IS NOT NULL;
+CREATE TABLE layer_factions(
+  layer TEXT NOT NULL,
+  team1 TEXT NOT NULL,
+  team2 TEXT NOT NULL,
+  count INTEGER DEFAULT 0,
+  last_seen INTEGER,
+  PRIMARY KEY(layer, team1, team2));
+`;
+
+// v6 — evidence files on bans and admin actions, private ban notes, the
+// scheduler, in-game admin calls (docs/BATCH3-CONTRACTS.md).
+const DDL_V6 = `
+ALTER TABLE bans ADD COLUMN note TEXT;
+CREATE TABLE evidence(
+  id INTEGER PRIMARY KEY,
+  target_type TEXT NOT NULL CHECK(target_type IN ('ban','action')),
+  target_id INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  stored_name TEXT NOT NULL,
+  filename TEXT,
+  mime TEXT,
+  size INTEGER,
+  caption TEXT,
+  uploaded_by INTEGER,
+  uploaded_at INTEGER,
+  deleted_by INTEGER,
+  deleted_at INTEGER);
+CREATE INDEX idx_evidence_target ON evidence(target_type, target_id);
+CREATE TABLE scheduled_tasks(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('broadcast','command','countdown')),
+  payload TEXT NOT NULL,
+  schedule TEXT NOT NULL,
+  conditions TEXT,
+  enabled INTEGER DEFAULT 1,
+  last_run_at INTEGER,
+  next_run_at INTEGER,
+  last_result TEXT,
+  created_by INTEGER,
+  created_at INTEGER,
+  updated_at INTEGER);
+CREATE TABLE admin_calls(
+  id INTEGER PRIMARY KEY,
+  time INTEGER NOT NULL,
+  match_id INTEGER,
+  player_id INTEGER,
+  player_name TEXT,
+  eos_id TEXT,
+  steam_id TEXT,
+  message TEXT,
+  status TEXT DEFAULT 'open' CHECK(status IN ('open','handled')),
+  handled_by INTEGER,
+  handled_at INTEGER);
+CREATE INDEX idx_admin_calls_time ON admin_calls(time);
+CREATE INDEX idx_admin_calls_status ON admin_calls(status);
+CREATE INDEX IF NOT EXISTS idx_actions_target ON admin_actions(target_player_id);
+`;
+
+// Shared warn/kick/ban wording every admin picks from (editable in Settings).
+const DEFAULT_REASON_TEMPLATES = [
+  { id: 'tk-warn', kind: 'warn', label: 'Teamkilling', reason: 'Teamkilling - check your targets. More TKs lead to a kick.' },
+  { id: 'rules-warn', kind: 'warn', label: 'Server rules', reason: 'Please follow the server rules - see our Discord.' },
+  { id: 'no-squad-kick', kind: 'kick', label: 'Not in a squad', reason: 'Join a squad - playing outside a squad is not allowed here.' },
+  { id: 'toxic-kick', kind: 'kick', label: 'Toxic behaviour', reason: 'Toxic behaviour - kicked by an admin.' },
+  { id: 'tk-ban', kind: 'ban', label: 'Intentional teamkilling', reason: 'Intentional teamkilling', interval: '3d' },
+  { id: 'grief-ban', kind: 'ban', label: 'Griefing friendly assets', reason: 'Griefing friendly radios/HABs', interval: '1w' },
+  { id: 'cheat-ban', kind: 'ban', label: 'Cheating', reason: 'Cheating', interval: '0' },
+];
+
+// The owner's requested one-press commands (toggles take 1/0).
+const DEFAULT_QUICK_COMMANDS = [
+  { id: 'no-respawn-timer', label: 'No respawn timer', command: 'AdminNoRespawnTimer', toggle: true },
+  { id: 'all-roles', label: 'All roles available', command: 'AdminForceAllRoleAvailability', toggle: true },
+];
 
 const USERS_V2_REBUILD = `
 CREATE TABLE users_v2(
@@ -274,6 +360,37 @@ function openDb(dbPath) {
       });
       version = 4;
       log.info('db', 'migrated schema to v4 (sessions disconnect index)');
+    }
+    if (version < 5) {
+      tx(() => {
+        exec(DDL_V5);
+        prepare('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)')
+          .run('quickCommands', JSON.stringify(DEFAULT_QUICK_COMMANDS));
+        // Builtin role perms are stored seed data with no implicit "all keys"
+        // bypass, so a new permission key must be granted explicitly.
+        exec("UPDATE roles SET perms = json_set(COALESCE(perms, '{}'), '$.quickcmd', json('true')) WHERE builtin = 1 AND name IN ('owner', 'admin');");
+        prepare('UPDATE schema_version SET version=?').run(5);
+      });
+      version = 5;
+      log.info('db', 'migrated schema to v5 (ban sources, faction combos, quick commands)');
+    }
+    if (version < 6) {
+      tx(() => {
+        exec(DDL_V6);
+        prepare('INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)')
+          .run('reasonTemplates', JSON.stringify(DEFAULT_REASON_TEMPLATES));
+        // BattleMetrics staff notes were stored as a trailing "[note]" on the
+        // player-visible reason; they move to the private note column.
+        const rows = prepare("SELECT id, reason FROM bans WHERE source = 'battlemetrics' AND reason LIKE '%]'").all();
+        const upd = prepare('UPDATE bans SET reason = ?, note = ? WHERE id = ?');
+        for (const r of rows) {
+          const m = /^(.*?)\s*\[([^[\]]*)\]$/s.exec(String(r.reason));
+          if (m) upd.run(m[1] || null, m[2] || null, r.id);
+        }
+        prepare('UPDATE schema_version SET version=?').run(6);
+      });
+      version = 6;
+      log.info('db', 'migrated schema to v6 (evidence, ban notes, scheduler, admin calls)');
     }
     return version;
   }

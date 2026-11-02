@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
-// SquadWatch boot & wiring (SPEC §16). Everything meets here:
+// A3 Admin boot & wiring (SPEC §16). Everything meets here:
 //   config -> db -> auth -> state -> rcon -> logsource -> parser wiring ->
-//   admin -> ingest -> steam/webhook -> pollers -> api.listen
+//   admin -> ingest -> steam/webhook/battlemetrics -> pollers -> api.listen
 const fs = require('node:fs');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
@@ -20,6 +20,13 @@ const { createAdmin } = require('./admin');
 const { createApi } = require('./api');
 const { createSteam } = require('./steam');
 const { createWebhook } = require('./webhook');
+const { createBattlemetrics } = require('./battlemetrics');
+const { createEvidence } = require('./evidence');
+const { createTemplates } = require('./templates');
+const { createRemoteBans } = require('./remotebans');
+const { createScheduler } = require('./scheduler');
+const { createAdminCalls } = require('./admincalls');
+const { createJoinAlerts } = require('./joinalerts');
 
 const ROOT = path.resolve(__dirname, '..');
 const VERSION = (() => {
@@ -79,6 +86,11 @@ async function main() {
     // real config.json's Discord channel or burn its Steam API key.
     cfg.discordWebhook = '';
     cfg.steamApiKey = '';
+    // Nor pull a real BattleMetrics ban list into the demo db with its token.
+    if (cfg.battlemetrics && typeof cfg.battlemetrics === 'object') {
+      cfg.battlemetrics.token = '';
+      cfg.battlemetrics.autoSync = false;
+    }
   }
   if (Number.isFinite(args.port)) cfg.web.port = args.port;
   if (cfg.demo === true && !args.demo) {
@@ -194,7 +206,38 @@ async function main() {
   if (steam && typeof steam.start === 'function') steam.start();
   // createWebhook self-wires its bus listeners (flag / match-end /
   // admin-action) — wiring them again here double-posted every Discord alert.
-  createWebhook({ config: cfg, bus });
+  const webhook = createWebhook({ config: cfg, bus, db });
+
+  // BattleMetrics ban import (docs/NEXT-CONTRACTS.md §3). A broken module
+  // must not take the panel down: the API then answers 503 for its routes.
+  let battlemetrics = null;
+  try {
+    battlemetrics = createBattlemetrics({ db, config: cfg, log, bus, admin });
+  } catch (e) {
+    log.error('boot', `BattleMetrics import unavailable: ${e && e.message ? e.message : e}`);
+  }
+
+  // Feature modules (docs/BATCH3-CONTRACTS.md §0). Each registers its own
+  // routes; one that fails to construct is skipped, never fatal.
+  const featureDeps = {
+    db, config: cfg, log, bus, state, admin, auth, webhook,
+    // The demo db sits in the real data/ folder; its evidence files must not
+    // share (and be deleted from) the real panel's content-addressed store.
+    dataDir: args.demo ? path.join(dataDir, 'demo') : dataDir,
+    // Persist + apply a settings patch exactly like POST /api/settings.
+    settings: { apply: (patch) => applySettings(patch) },
+  };
+  const features = [];
+  for (const [name, make] of [
+    ['evidence', createEvidence], ['templates', createTemplates], ['remote ban list', createRemoteBans],
+    ['scheduler', createScheduler], ['admin calls', createAdminCalls], ['join alerts', createJoinAlerts],
+  ]) {
+    try {
+      features.push(make(featureDeps));
+    } catch (e) {
+      log.error('boot', `${name} unavailable: ${e && e.message ? e.message : e}`);
+    }
+  }
 
   // ---------------------------------------------------------------- pollers
   const timers = [];
@@ -232,34 +275,68 @@ async function main() {
       lastPollErr.delete('serverinfo');
     } catch (e) { pollErr('serverinfo', e); }
   }
+  // Faction-combo learning (docs/NEXT-CONTRACTS.md §1): DebugPrintFactionsList
+  // only writes the server log, so pairings are learned from what
+  // ShowCurrentMap/ShowNextMap print. A combo's count rises once per new
+  // appearance (state.applyMapInfo decides); every sighting refreshes last_seen.
+  function learnFactions(slot, parsed) {
+    const combo = state.applyMapInfo(slot, parsed);
+    if (!combo) return;
+    try {
+      db.prepare(
+        `INSERT INTO layer_factions(layer, team1, team2, count, last_seen) VALUES(?,?,?,?,?)
+         ON CONFLICT(layer, team1, team2) DO UPDATE SET count = count + excluded.count, last_seen = excluded.last_seen`
+      ).run(combo.layer, combo.team1, combo.team2, combo.fresh ? 1 : 0, Date.now());
+    } catch (e) {
+      log.warn('poll', `faction combo not recorded: ${e.message}`);
+    }
+  }
+  async function pollCurrentMap() {
+    if (!connected()) return;
+    try {
+      learnFactions('current', parser.parseCurrentMap(await rcon.exec('ShowCurrentMap')));
+      lastPollErr.delete('currentmap');
+    } catch (e) { pollErr('currentmap', e); }
+  }
   async function pollNextMap() {
     if (!connected()) return;
     try {
       const r = parser.parseNextMap(await rcon.exec('ShowNextMap'));
       if (r && r.layer) state.nextLayer = r.layer;
+      learnFactions('next', r);
       lastPollErr.delete('nextmap');
     } catch (e) { pollErr('nextmap', e); }
   }
   async function refreshLayers() {
     if (!connected()) return;
     try {
-      const layers = parser.parseLayers(await rcon.exec('ListLayers'));
-      if (Array.isArray(layers) && layers.length) {
-        state.layers = layers;
-        state.layersCachedAt = Date.now();
-      }
+      state.applyLayers(parser.parseLayerList(await rcon.exec('ListLayers')));
       lastPollErr.delete('layers');
     } catch (e) { pollErr('layers', e); }
   }
   function kickPolls(withLayers) {
     if (withLayers) refreshLayers();
-    pollServerInfo().then(pollPlayers).then(pollSquads).then(pollNextMap);
+    pollServerInfo().then(pollPlayers).then(pollSquads).then(pollCurrentMap).then(pollNextMap);
   }
   timers.push(setInterval(pollPlayers, 15000));
   timers.push(setInterval(pollSquads, 15000));
   timers.push(setInterval(pollServerInfo, 30000));
+  timers.push(setInterval(pollCurrentMap, 60000));
   timers.push(setInterval(pollNextMap, 60000));
   timers.push(setInterval(refreshLayers, 6 * 3600 * 1000));
+
+  // A layer change sent from the panel shows in ShowNextMap at once (and in
+  // ShowCurrentMap after travel): re-poll shortly instead of waiting a minute.
+  let layerRepoll = null;
+  bus.on('admin-action', (row) => {
+    if (!row || row.rconOk !== 1 || (row.action !== 'changeLayer' && row.action !== 'setNextLayer')) return;
+    if (layerRepoll) clearTimeout(layerRepoll);
+    layerRepoll = setTimeout(() => {
+      layerRepoll = null;
+      pollCurrentMap().then(pollNextMap);
+    }, 2000);
+    if (typeof layerRepoll.unref === 'function') layerRepoll.unref();
+  });
 
   // ------------------------------------- runtime settings (docs/R-I-S §3)
   // The Settings API changes cfg IN PLACE (ingest/webhook/api read it live),
@@ -321,6 +398,13 @@ async function main() {
     }
     if (touched('flags.chatWatchlist') && typeof ingest.refreshWatchlist === 'function') {
       ingest.refreshWatchlist();
+    }
+    if (touched('battlemetrics') && battlemetrics) {
+      try {
+        battlemetrics.reconfigure();
+      } catch (e) {
+        log.error('settings', `BattleMetrics reconfigure failed: ${e.message}`);
+      }
     }
     log.info('settings', `applied: ${res.changedPaths.join(', ')}`);
     return res;
@@ -435,7 +519,11 @@ async function main() {
   const api = createApi({
     db, state, ingest, rcon, bus, auth, admin, config: cfg, parserHealth,
     version: VERSION, demoCli: args.demo,
+    // The demo is where the UI is developed: it reads public/ live.
+    staticSnapshot: !args.demo,
     runtime: { applySettings, testRcon, testLog },
+    battlemetrics,
+    extensions: features,
   });
 
   if (cfg.squad.rconHost) rcon.connect();
@@ -462,13 +550,25 @@ async function main() {
 
   const shownHost = host === '0.0.0.0' ? 'localhost' : host;
   log.info('boot', '────────────────────────────────────────────────');
-  log.info('boot', `SquadWatch v${VERSION} up: http://${shownHost}:${port}${cfg.demo ? '  (DEMO MODE)' : ''}`);
+  log.info('boot', `A3 Admin v${VERSION} up: http://${shownHost}:${port}${cfg.demo ? '  (DEMO MODE)' : ''}`);
   const rconShown = cfg.squad.rconHost ? `${cfg.squad.rconHost}:${cfg.squad.rconPort}` : 'not linked (set in Settings)';
   log.info('boot', `db: ${dbPath} (${db.backend})  ·  log: ${cfg.log.mode}  ·  rcon: ${rconShown}`);
   if (auth.setupToken) {
     log.info('boot', `FIRST RUN — create the owner account in the browser. Setup token: ${auth.setupToken}`);
   }
   log.info('boot', '────────────────────────────────────────────────');
+
+  // Auto-sync starts only once the panel is serving.
+  if (battlemetrics) {
+    try {
+      battlemetrics.start();
+    } catch (e) {
+      log.error('boot', `BattleMetrics auto-sync failed to start: ${e.message}`);
+    }
+  }
+  for (const f of features) {
+    try { if (typeof f.start === 'function') f.start(); } catch (e) { log.error('boot', `feature start failed: ${e.message}`); }
+  }
 
   // --------------------------------------------------------------- shutdown
   let shuttingDown = false;
@@ -477,6 +577,9 @@ async function main() {
     shuttingDown = true;
     log.info('boot', `${sig} — shutting down`);
     for (const t of timers) clearInterval(t);
+    if (layerRepoll) clearTimeout(layerRepoll);
+    try { if (battlemetrics) battlemetrics.stop(); } catch (_e) { /* */ }
+    for (const f of features) { try { if (typeof f.stop === 'function') f.stop(); } catch (_e) { /* */ } }
     try { src.logsource.stop(); } catch (_e) { /* */ }
     try { if (ingest.stop) ingest.stop(); else ingest.stopTimers(); } catch (_e) { /* */ }
     try { if (steam && steam.stop) steam.stop(); } catch (_e) { /* */ }

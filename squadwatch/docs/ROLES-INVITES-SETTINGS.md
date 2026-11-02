@@ -172,7 +172,10 @@ one-time link with copy button + warning it is shown once) and an Invites table
   (surfaced as `persistError`; the live change still applies), writes 0600 for
   new files and preserves the existing file's mode; the old logsource instance
   is fully detached on swap so it can neither double-ingest nor overwrite the
-  new source's status.
+  new source's status. A failed write's text (scrubbed of secrets) goes to
+  the caller only: the `settings-update` audit row, which roles without
+  `settings` read, records `persistError: 'config.json not written — see the
+  panel log'`.
 - GET /api/settings already returns `redactedConfig()` + status — it gains
   `editable: <the allowlist tree>` metadata? No — the frontend hardcodes the
   form; GET just keeps serving current (redacted) values, now including which
