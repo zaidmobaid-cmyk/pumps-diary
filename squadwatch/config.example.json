@@ -1,0 +1,40 @@
+{
+  "web": { "port": 8787, "host": "0.0.0.0", "publicUrl": "", "secureCookies": "auto" },
+  "squad": { "rconHost": "", "rconPort": 21114, "rconPassword": "CHANGEME" },
+  "log": {
+    "mode": "local",
+    "path": "/home/squad/SquadGame/Saved/Logs/SquadGame.log",
+    "pollMs": 1500,
+    "backfill": false,
+    "timezoneOffsetMinutes": 0,
+    "ftp":  { "host": "", "port": 21, "user": "", "password": "", "path": "/SquadGame/Saved/Logs/SquadGame.log", "secure": false },
+    "sftp": { "host": "", "port": 22, "user": "", "password": "", "privateKeyPath": "", "path": "/SquadGame/Saved/Logs/SquadGame.log" }
+  },
+  "dbPath": "data/squadwatch.db",
+  "steamApiKey": "",
+  "discordWebhook": "",
+  "webhookEvents": { "flags": true, "bans": true, "kicks": true, "warns": false, "matchEnd": false },
+  "flags": {
+    "tkSpreeCount": 3,
+    "tkSpreeWindowSec": 180,
+    "massTkCount": 5,
+    "newPlayerMinutes": 15,
+    "chatWatchlist": []
+  },
+  "autoWarnTeamkiller": false,
+  "autoWarnMessage": "Teamkill detected: {victim}. TKs are logged. Apologize in all-chat.",
+  "retention": { "chatDays": 0, "popDays": 30 },
+  "battlemetrics": { "token": "", "banListId": "", "autoSync": false, "syncHours": 6 },
+  "evidence": { "maxMB": 50 },
+  "remoteBanList": { "enabled": false, "key": "", "includeEos": false },
+  "adminCalls": {
+    "enabled": true,
+    "triggers": ["!admin"],
+    "discordRoleId": "",
+    "reply": "Admins have been notified - hang tight.",
+    "cooldownSec": 60
+  },
+  "joinAlerts": { "watchlist": true, "flagged": true, "banEvasion": true, "autoKickEvasion": false },
+  "demo": false,
+  "logUnparsed": false
+}
